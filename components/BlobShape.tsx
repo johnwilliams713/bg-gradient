@@ -5,7 +5,12 @@
  * is positioned absolutely at screen (-83.69, 642.47) with size 568.37 × 401.55.
  *
  * Animation:
- *   • Idle:  all three breathe at the same slow tempo (~3.5 s loop).
+ *   • Idle: each shape independently breathes (scale), bobs (vertical shift),
+ *     and slowly spins around its own centre. Periods are short enough to feel
+ *     organic, phases are evenly spread across the trio, and the side shapes
+ *     spin in opposite directions for a subtle mirrored swirl. Because the
+ *     three motions share no common period, the trio never resyncs — the visual
+ *     "beat" between them is constantly drifting.
  *   • Voice: each shape responds to a different envelope follower derived from
  *     the same voiceEnergy signal — emulating a low/mid/high split:
  *
@@ -104,14 +109,35 @@ const RIGHT_PATH =
 
 const TWO_PI = Math.PI * 2;
 
-// Shared idle breath — all three shapes pulse together at the same tempo.
-const BREATH_PERIOD = 3.5;     // seconds
-const BREATH_AMP    = 0.022;   // peak deviation → range [1, 1 + 2*BREATH_AMP]
+// Idle breath — same period for all three, but each shape has its own phase
+// so they pulse at slightly different moments.
+const BREATH_PERIOD       = 3.5;            // seconds
+const BREATH_AMP          = 0.022;          // peak deviation → range [1, 1 + 2*BREATH_AMP]
+const BREATH_PHASE_LEFT   = 0;
+const BREATH_PHASE_CENTER = TWO_PI * 0.33;
+const BREATH_PHASE_RIGHT  = TWO_PI * 0.66;
+
+// Idle bob — small vertical drift in screen-space pixels. Same period for all
+// three but evenly-spaced phases so the trio rolls like a slow wave.
+const BOB_PERIOD       = 4.2;
+const BOB_AMP          = 7;                  // px
+const BOB_PHASE_LEFT   = 0;
+const BOB_PHASE_CENTER = TWO_PI * 0.33;
+const BOB_PHASE_RIGHT  = TWO_PI * 0.66;
+
+// Slow rotation — seconds per full turn. Negative = counter-clockwise.
+// LEFT and RIGHT counter-rotate so their gradients sweep against each other in
+// the overlap zone, and CENTER drifts on a deliberately incommensurate period
+// so the trio never re-syncs visually.
+const ROT_PERIOD_LEFT   =  48;
+const ROT_PERIOD_CENTER =  72;
+const ROT_PERIOD_RIGHT  = -48;
 
 // Per-shape voice-reactive scaling, on top of the breath.
 const LEFT_VOICE   = 0.22;   // low band gets a moderate swell
 const CENTER_VOICE = 0.30;   // mid band gets the strongest response
 const RIGHT_VOICE  = 0.26;   // high band — sharp but smaller in magnitude
+
 
 // Envelope-follower coefficients (per-frame, ~60 fps assumption — fine for a
 // purely visual effect; if frame-rate doubles on a 120 Hz display the followers
@@ -155,39 +181,70 @@ export function BlobShape({ voiceEnergy }: Props) {
     time.value = info.timestamp / 1000;
   });
 
-  // Shared breathing waveform — same for all three shapes.
-  const breath = useDerivedValue(() =>
-    1 + BREATH_AMP + BREATH_AMP * Math.sin((TWO_PI * time.value) / BREATH_PERIOD),
+  // Per-shape breath — same waveform shape, different phase each.
+  const leftBreath = useDerivedValue(() =>
+    1 + BREATH_AMP + BREATH_AMP * Math.sin(
+      (TWO_PI * time.value) / BREATH_PERIOD + BREATH_PHASE_LEFT,
+    ),
+  );
+  const centerBreath = useDerivedValue(() =>
+    1 + BREATH_AMP + BREATH_AMP * Math.sin(
+      (TWO_PI * time.value) / BREATH_PERIOD + BREATH_PHASE_CENTER,
+    ),
+  );
+  const rightBreath = useDerivedValue(() =>
+    1 + BREATH_AMP + BREATH_AMP * Math.sin(
+      (TWO_PI * time.value) / BREATH_PERIOD + BREATH_PHASE_RIGHT,
+    ),
   );
 
-  // Per-shape scales: shared breath + band-specific voice response.
-  const leftScale   = useDerivedValue(() => breath.value + lowEnv.value  * LEFT_VOICE);
-  const centerScale = useDerivedValue(() => breath.value + midEnv.value  * CENTER_VOICE);
-  const rightScale  = useDerivedValue(() => breath.value + highEnv.value * RIGHT_VOICE);
+  // Per-shape vertical bob — small screen-space drift.
+  const leftBob = useDerivedValue(() =>
+    BOB_AMP * Math.sin((TWO_PI * time.value) / BOB_PERIOD + BOB_PHASE_LEFT),
+  );
+  const centerBob = useDerivedValue(() =>
+    BOB_AMP * Math.sin((TWO_PI * time.value) / BOB_PERIOD + BOB_PHASE_CENTER),
+  );
+  const rightBob = useDerivedValue(() =>
+    BOB_AMP * Math.sin((TWO_PI * time.value) / BOB_PERIOD + BOB_PHASE_RIGHT),
+  );
 
-  // Skia transforms — apply in order:
-  //   1. translate to (frame_x + shape_cx, frame_y + shape_cy)  (places centre)
-  //   2. scale around that origin
-  //   3. translate back by (-shape_cx, -shape_cy)               (so the path's
-  //      local 0,0 ends up at frame_x, frame_y when scale = 1)
+  // Per-shape rotation (radians). Sign of period sets direction.
+  const leftRot   = useDerivedValue(() => (TWO_PI * time.value) / ROT_PERIOD_LEFT);
+  const centerRot = useDerivedValue(() => (TWO_PI * time.value) / ROT_PERIOD_CENTER);
+  const rightRot  = useDerivedValue(() => (TWO_PI * time.value) / ROT_PERIOD_RIGHT);
+
+  // Per-shape scales: own breath + band-specific voice response.
+  const leftScale   = useDerivedValue(() => leftBreath.value   + lowEnv.value  * LEFT_VOICE);
+  const centerScale = useDerivedValue(() => centerBreath.value + midEnv.value  * CENTER_VOICE);
+  const rightScale  = useDerivedValue(() => rightBreath.value  + highEnv.value * RIGHT_VOICE);
+
+  // Skia transforms — applied last-to-first to each point. Reading bottom-up:
+  //   • move shape's centre to the origin
+  //   • scale around the origin
+  //   • rotate around the origin (so spin pivots on the shape's centre)
+  //   • translate the shape back to its frame-local position, plus the bob
   const leftTransform = useDerivedValue(() => [
     { translateX: LEFT_X + LEFT_CX },
-    { translateY: LEFT_Y + LEFT_CY },
-    { scale: leftScale.value },
+    { translateY: LEFT_Y + LEFT_CY + leftBob.value },
+    { rotate:     leftRot.value },
+    { scale:      leftScale.value },
     { translateX: -LEFT_CX },
     { translateY: -LEFT_CY },
   ]);
   const centerTransform = useDerivedValue(() => [
     { translateX: CENTER_X + CENTER_CX },
-    { translateY: CENTER_Y + CENTER_CY },
-    { scale: centerScale.value },
+    { translateY: CENTER_Y + CENTER_CY + centerBob.value },
+    { rotate:     centerRot.value },
+    { scale:      centerScale.value },
     { translateX: -CENTER_CX },
     { translateY: -CENTER_CY },
   ]);
   const rightTransform = useDerivedValue(() => [
     { translateX: RIGHT_X + RIGHT_CX },
-    { translateY: RIGHT_Y + RIGHT_CY },
-    { scale: rightScale.value },
+    { translateY: RIGHT_Y + RIGHT_CY + rightBob.value },
+    { rotate:     rightRot.value },
+    { scale:      rightScale.value },
     { translateX: -RIGHT_CX },
     { translateY: -RIGHT_CY },
   ]);
@@ -219,7 +276,7 @@ export function BlobShape({ voiceEnergy }: Props) {
               <LinearGradient
                 start={vec(217.431, -101.467)}
                 end={vec(216.199, 247.604)}
-                colors={['#FF8547', 'rgba(255,133,71,0)']}
+                colors={['#FF8547', 'rgba(255,133,71,0.1)']}
                 positions={[0, 0.844]}
               />
             </Path>
@@ -231,7 +288,7 @@ export function BlobShape({ voiceEnergy }: Props) {
               <LinearGradient
                 start={vec(33.864, 46.807)}
                 end={vec(142.253, 266.343)}
-                colors={['rgba(255,87,0,0.4)', 'rgba(255,87,0,0)']}
+                colors={['rgba(255,87,0,0.4)', 'rgba(255,87,0,0.1)']}
               />
             </Path>
           </Group>
@@ -242,7 +299,7 @@ export function BlobShape({ voiceEnergy }: Props) {
               <LinearGradient
                 start={vec(124.411, -101.467)}
                 end={vec(125.643, 247.604)}
-                colors={['#FBBF24', 'rgba(251,191,36,0)']}
+                colors={['#FBBF24', 'rgba(251,191,36,0.1)']}
                 positions={[0, 0.844]}
               />
             </Path>

@@ -17,29 +17,11 @@ import { PALETTE } from './constants/palette';
 
 type Message = { id: string; role: 'user' | 'assistant'; text: string };
 
-const SEED_MESSAGES: Message[] = [
-  {
-    id: 'seed-0',
-    role: 'assistant',
-    text: "I'm a proof-of-concept layout. The warm blob below drifts and breathes slowly — tap the mic and it pulses with your voice like a visualiser.",
-  },
-  {
-    id: 'seed-1',
-    role: 'user',
-    text: 'Love it. Can it fill the whole bottom of the screen?',
-  },
-  {
-    id: 'seed-2',
-    role: 'assistant',
-    text: "Yes — the blob peeks 50 % above the bottom edge, morphs gently between three organic shapes, and scales up the moment your voice is detected.",
-  },
-];
-
 const VOICE_ACK =
   'Got it — this PoC does not call a real model yet, but your voice message was captured.';
 
 export default function App() {
-  const [messages, setMessages] = useState<Message[]>(SEED_MESSAGES);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState('');
 
   const handleSessionEnd = useCallback((lastTranscript: string) => {
