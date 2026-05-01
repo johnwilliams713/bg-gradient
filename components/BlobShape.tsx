@@ -1,34 +1,45 @@
 /**
- * BlobShape — three Figma blobs from node 11118:17225 ("Group 4").
+ * BlobShape — three-layer procedural wave visualiser.
  *
- * Static placement is fixed and does not depend on screen size — the Figma frame
- * is positioned absolutely at screen (-83.69, 642.47) with size 568.37 × 401.55.
+ * Three stacked sine-summed wave layers (back / mid / fore) anchored to the
+ * bottom of the screen.
+ *
+ * Style reference: Figma node 11144:17634 ("waves"). Geometry is generated in
+ * code so it can react live to voice; visual style is a single shared FF5700
+ * linear gradient (50% alpha at the wave crest, 10% alpha at canvas bottom).
  *
  * Animation:
- *   • Idle: each shape independently breathes (scale), bobs (vertical shift),
- *     and slowly spins around its own centre. Periods are short enough to feel
- *     organic, phases are evenly spread across the trio, and the side shapes
- *     spin in opposite directions for a subtle mirrored swirl. Because the
- *     three motions share no common period, the trio never resyncs — the visual
- *     "beat" between them is constantly drifting.
- *   • Voice: each shape responds to a different envelope follower derived from
- *     the same voiceEnergy signal — emulating a low/mid/high split:
+ *   • Idle:  each layer is a sum of TWO low-freq sub-harmonics (H1a + H1b)
+ *            whose unequal temporal speeds make peaks and troughs drift in
+ *            place — a slow ocean-swell feel with no horizontal scroll. Full
+ *            screen width.
+ *   • Voice: each layer adds a centred, strictly non-negative "swell" on top
+ *            of the ambient surface:
  *
- *        LEFT   (coral)  → "low"   slow attack & release, smooth swell
- *        CENTER (peach)  → "mid"   tracks the speech envelope closely
- *        RIGHT  (yellow) → "high"  fast transient follower, spikes on onsets
+ *              voiceShape(u) = bell(u) · (1 + RIPPLE_AMP · cos(2πk·(u − ½)))
  *
- *     This is not a real FFT — expo-speech-recognition only emits a scalar
- *     volume — but the three followers give each shape a perceptibly distinct
- *     motion profile.
+ *            bell(u) = sin(π·u)^BELL_POWER is zero at the edges, peaks at
+ *            u = ½. The cosine ripple is centred on u = ½ so the result is
+ *            automatically left-right symmetric, and (1 + amp·cos) stays
+ *            positive while RIPPLE_AMP < 1, so the swell only ever pushes
+ *            the wave UPWARD — no center-sinking. Each layer's swell is
+ *            scaled by its assigned voice band envelope:
  *
- * The Skia canvas is over-sized (CANVAS_PAD on every side) so shapes can scale
- * up freely without clipping at the canvas edge. An outer Group translates the
- * scene back so screen-space positioning stays identical to the Figma frame.
+ *               BACK  ←  low envelope   (slow attack/release)
+ *               MID   ←  mid envelope   (rhythm-tracking)
+ *               FORE  ←  high envelope  (transient spikes on word onsets)
+ *
+ *            voiceEnergy is a single scalar from expo-speech-recognition; the
+ *            three "bands" are envelope followers on that signal, not a real
+ *            FFT. They give perceptibly distinct timing per layer regardless.
+ *
+ * Path smoothing: each layer's wave is built as a cubic Bezier spline using
+ * Catmull-Rom-to-Bezier conversion on the sampled (x, y) points, so the curve
+ * stays visually smooth even with a moderate sample count.
  */
 
 import { useMemo } from 'react';
-import { StyleSheet, View } from 'react-native';
+import { Dimensions, StyleSheet, View } from 'react-native';
 import {
   useDerivedValue,
   useFrameCallback,
@@ -36,6 +47,7 @@ import {
   type SharedValue,
 } from 'react-native-reanimated';
 import {
+  BlurMask,
   Canvas,
   Group,
   LinearGradient,
@@ -44,135 +56,173 @@ import {
   vec,
 } from '@shopify/react-native-skia';
 
-// ─── Figma source data ───────────────────────────────────────────────────────
+const { width: SCREEN_W } = Dimensions.get('window');
+
+// ─── Geometry ────────────────────────────────────────────────────────────────
 //
-// Frame "Group 4"  (568.37 × 401.55) at screen (-83.69, 642.47).
+// The component sits absolutely at the bottom of the screen. All wave coords
+// below are in canvas-local pixels: y = 0 is the canvas top, y = WAVE_HEIGHT
+// is the canvas bottom (= screen bottom).
 //
-//   Left   frame-local top-left (0,      61.04)   viewBox 341.842 × 340.507
-//          fill: linear-gradient #FF8547 → 84.4 % transparent
-//   Center frame-local top-left (119.87, 0)       viewBox 328.633 × 353.268
-//          fill: linear-gradient #FF5700@0.4 → transparent
-//   Right  frame-local top-left (226.53, 61.04)   viewBox 341.842 × 340.507
-//          fill: linear-gradient #FBBF24 → 84.4 % transparent
+// Per-layer "height" matches the Figma node spec — the at-rest distance from
+// each wave's mean line (baseline) down to the canvas bottom. So a layer with
+// height 300 has its baseline 300 px above the screen bottom.
 
-const FRAME_LEFT = -83.685;
-const FRAME_TOP  = 642.47;
-const FRAME_W    = 568.37;
-const FRAME_H    = 401.55;
+const WAVE_HEIGHT = 400; // canvas height; gives ~100 px headroom above tallest baseline for voice ripples
 
-// Padding around the Figma frame so scaled shapes don't clip at the canvas
-// edge. Sized to comfortably fit the largest expected scale (~1 + breath +
-// voice peak ≈ 1.4 of the largest shape, ~353 px → grows by ~140 px).
-const CANVAS_PAD = 200;
+const BACK_HEIGHT = 300;
+const MID_HEIGHT  = 280;
+const FORE_HEIGHT = 240;
 
-const CANVAS_LEFT = FRAME_LEFT - CANVAS_PAD;
-const CANVAS_TOP  = FRAME_TOP  - CANVAS_PAD;
-const CANVAS_W    = FRAME_W    + CANVAS_PAD * 2;
-const CANVAS_H    = FRAME_H    + CANVAS_PAD * 2;
+const BACK_BASELINE_Y = WAVE_HEIGHT - BACK_HEIGHT; // 100
+const MID_BASELINE_Y  = WAVE_HEIGHT - MID_HEIGHT;  // 120
+const FORE_BASELINE_Y = WAVE_HEIGHT - FORE_HEIGHT; // 160
 
-// Frame-local positions (top-left of each shape's bbox, inside the Figma frame)
-const LEFT_X   = 0;
-const LEFT_Y   = 61.04;
-const CENTER_X = 119.87;
-const CENTER_Y = 0;
-const RIGHT_X  = 226.53;
-const RIGHT_Y  = 61.04;
+// Path resolution. With cubic-Bezier smoothing, even modest sample counts read
+// as fully smooth; 48 leaves plenty of headroom for the voice H3 ripples
+// (max k ≈ 9.5 cycles per screen).
+const SAMPLE_COUNT = 48;
 
-// Shape-local centres (centre of each shape's own viewBox), used as the pivot
-// when scaling so the shape grows/shrinks around its own centre.
-const LEFT_CX   = 170.921;
-const LEFT_CY   = 170.254;
-const CENTER_CX = 164.317;
-const CENTER_CY = 176.634;
-const RIGHT_CX  = 170.921;
-const RIGHT_CY  = 170.254;
+// ─── Audio envelope follower coefficients ───────────────────────────────────
+const LOW_LERP   = 0.07;
+const MID_LERP   = 0.22;
+const HIGH_DECAY = 0.78;
+const HIGH_GAIN  = 4.0;
 
-const LEFT_PATH =
-  'M283.926 50.9652C354.746 118.055 361.563 225.849 299.152 291.73' +
-  'C236.74 357.611 128.735 356.632 57.9157 289.542' +
-  'C-12.9041 222.452 -19.7206 114.658 42.6905 48.777' +
-  'C105.102 -17.1041 213.107 -16.1244 283.926 50.9652Z';
-
-const CENTER_PATH =
-  'M328.633 176.634C328.633 274.186 255.066 353.268 164.317 353.268' +
-  'C73.567 353.268 0 274.186 0 176.634' +
-  'C0 79.0818 73.567 0 164.317 0' +
-  'C255.066 0 328.633 79.0818 328.633 176.634Z';
-
-const RIGHT_PATH =
-  'M57.9157 50.9652C-12.9041 118.055 -19.7206 225.849 42.6905 291.73' +
-  'C105.102 357.611 213.107 356.632 283.926 289.542' +
-  'C354.746 222.452 361.563 114.658 299.152 48.777' +
-  'C236.74 -17.1041 128.735 -16.1244 57.9157 50.9652Z';
-
-// ─── Animation tuning ────────────────────────────────────────────────────────
+// ─── Wave model ──────────────────────────────────────────────────────────────
+//
+//    y(x, t) = baseline
+//             − a1a · sin(2π·k1a·u + ω1a·t + φ1a)        (H1a — ambient)
+//             − a1b · sin(2π·k1b·u + ω1b·t + φ1b)        (H1b — ambient)
+//             − bandEnv · voiceGain · voiceShape(u)      (centred voice swell)
+//
+// H1a, H1b carry the "rolling hill" ambient — full-width, slow morphing,
+// untouched in voice mode. The voice contribution is a centred non-negative
+// swell that only adds height; it never pulls the wave below the H1 surface.
 
 const TWO_PI = Math.PI * 2;
 
-// Idle breath — same period for all three, but each shape has its own phase
-// so they pulse at slightly different moments.
-const BREATH_PERIOD       = 3.5;            // seconds
-const BREATH_AMP          = 0.022;          // peak deviation → range [1, 1 + 2*BREATH_AMP]
-const BREATH_PHASE_LEFT   = 0;
-const BREATH_PHASE_CENTER = TWO_PI * 0.33;
-const BREATH_PHASE_RIGHT  = TWO_PI * 0.66;
-
-// Idle bob — small vertical drift in screen-space pixels. Same period for all
-// three but evenly-spaced phases so the trio rolls like a slow wave.
-const BOB_PERIOD       = 4.2;
-const BOB_AMP          = 7;                  // px
-const BOB_PHASE_LEFT   = 0;
-const BOB_PHASE_CENTER = TWO_PI * 0.33;
-const BOB_PHASE_RIGHT  = TWO_PI * 0.66;
-
-// Slow rotation — seconds per full turn. Negative = counter-clockwise.
-// LEFT and RIGHT counter-rotate so their gradients sweep against each other in
-// the overlap zone, and CENTER drifts on a deliberately incommensurate period
-// so the trio never re-syncs visually.
-const ROT_PERIOD_LEFT   =  48;
-const ROT_PERIOD_CENTER =  72;
-const ROT_PERIOD_RIGHT  = -48;
-
-// Per-shape voice-reactive scaling, on top of the breath.
-const LEFT_VOICE   = 0.22;   // low band gets a moderate swell
-const CENTER_VOICE = 0.30;   // mid band gets the strongest response
-const RIGHT_VOICE  = 0.26;   // high band — sharp but smaller in magnitude
-
-
-// Envelope-follower coefficients (per-frame, ~60 fps assumption — fine for a
-// purely visual effect; if frame-rate doubles on a 120 Hz display the followers
-// just feel a touch snappier, which is acceptable).
+// ─── Voice swell shape ───────────────────────────────────────────────────────
 //
-//   "Low"        slow IIR low-pass → smooth swell, lags onsets/releases.
-//   "Mid"        moderate IIR      → tracks speech rhythm one beat behind.
-//   "High"       peak follower with fast decay, driven by positive deltas.
-const LOW_LERP   = 0.07;   // lower → slower
-const MID_LERP   = 0.22;
-const HIGH_DECAY = 0.78;   // each frame keeps this fraction of previous peak
-const HIGH_GAIN  = 4.0;    // amplifies tiny per-frame deltas into visible kicks
+//    voiceShape(u) = bell(u) · (1 + VOICE_RIPPLE_AMP · cos(2πk·(u − 0.5)))
+//
+// • bell(u) = sin(π·u)^BELL_POWER — zero at u=0,1, peaks 1.0 at u=0.5.
+// • cos(2π·k·(u − 0.5)) is centred on u=0.5, so the entire shape is
+//   automatically symmetric across the screen midline.
+// • Keeping VOICE_RIPPLE_AMP < 1 guarantees the (1 + amp·cos) factor stays
+//   ≥ 0, so voiceShape ≥ 0 everywhere — the wave only ever rises in voice
+//   mode, never sinks below its ambient surface.
+
+// BELL_POWER tunes the central swell width:
+//   1.0 — broad arch
+//   2.0 — Hanning window (classic; chosen here)
+//   3.0+ — narrow central swell, very flat edges
+const BELL_POWER = 2.0;
+
+// Number of cosine cycles across the full width. Visible peaks land at
+// u = 0.5, 0.5 ± 1/k, 0.5 ± 2/k, …; only the central few are amplified by
+// bell(u) — the rest fade to zero before they reach the screen edges.
+//   1 — pure central peak, no modulation
+//   2 — central peak with broad shoulders (smooth single hump)
+//   3 — central peak + one symmetric side bump on each flank (Siri-like)
+//   4 — central peak + two side bumps on each flank
+const VOICE_RIPPLE_K = 2;
+
+// Ripple depth (0..1). Larger = more pronounced side peaks vs. central peak.
+// Must be < 1 to keep voiceShape non-negative.
+const VOICE_RIPPLE_AMP = 0.20;
+
+type Harmonic = { k: number; omega: number; phase: number };
+
+type LayerHarmonics = {
+  h1a: Harmonic;
+  h1b: Harmonic;
+};
+
+const BACK_HARMONICS: LayerHarmonics = {
+  h1a: { k: 1.0, omega: 0.08, phase: 0           },
+  h1b: { k: 1.3, omega: 0.13, phase: Math.PI / 5 },
+};
+
+const MID_HARMONICS: LayerHarmonics = {
+  h1a: { k: 1.1, omega: 0.10, phase: Math.PI / 7 },
+  h1b: { k: 1.4, omega: 0.07, phase: Math.PI / 3 },
+};
+
+const FORE_HARMONICS: LayerHarmonics = {
+  h1a: { k: 1.2, omega: 0.12, phase: Math.PI / 11 },
+  h1b: { k: 1.5, omega: 0.16, phase: Math.PI / 2  },
+};
+
+// H1 (rolling-hill) amplitudes per layer in px. H1a / H1b are split 70 / 30:
+// H1a dominates for a calm shape, H1b adds gentle in-place morphing.
+const BACK_H1_AMP = 32;
+const MID_H1_AMP  = 24;
+const FORE_H1_AMP = 18;
+
+const H1_SPLIT_A = 0.7;
+const H1_SPLIT_B = 0.3;
+
+// Per-layer voice swell amplitude (px). At bandEnv = 1 and the voice shape's
+// peak (u = 0.5), the wave is pushed up by VOICE_GAIN · (1 + VOICE_RIPPLE_AMP)
+// pixels. With BACK_VOICE_GAIN = 50 and RIPPLE_AMP = 0.35, that's ~67 px max
+// — comfortably within the canvas headroom above each baseline.
+const BACK_VOICE_GAIN = 50;
+const MID_VOICE_GAIN  = 40;
+const FORE_VOICE_GAIN = 30;
+
+// ─── Bloom + edge softening ──────────────────────────────────────────────────
+//
+// Each wave is rendered in two passes:
+//   1. A wider, heavily-blurred copy at reduced opacity, drawn first as a
+//      soft halo extending past the wave's edges (bloom).
+//   2. The main wave on top, with a small blur for softened edges.
+//
+// Standard alpha blending (no blendMode change) — additive blends would just
+// clamp to white against the app's white background and disappear, so we rely
+// on the gradient's own translucency for the halo to read.
+const EDGE_BLUR     = 3;     // px — subtle softening of the main wave's edges
+const BLOOM_BLUR    = 30;    // px — width of the soft halo around each wave
+const BLOOM_OPACITY = 0.4;   // halo strength (0..1)
+
+// ─── Gradient ────────────────────────────────────────────────────────────────
+//
+// Two-stop warm gradient shared by all three layers (Figma node 11144:17634):
+// FF5700 (orange-red) at the wave's crest, fading to FBBF24 (warm yellow) at
+// the canvas bottom. Stops are full-alpha; overall transparency comes from
+// LAYER_OPACITY below — matching the Figma "100% / 100% stops, 20% layer
+// opacity" setup.
+
+const GRAD_COLORS = ['#FF5700', '#FBBF24'];
+
+// Overall opacity applied to the entire wave composition (all three layers,
+// bloom + main). Multiplies through to give effective per-pixel alpha, so
+// reducing this is the cheapest way to dial saturation up or down without
+// touching gradients or bloom values individually.
+const LAYER_OPACITY = 0.2;
+
+const BACK_GRAD_TOP = BACK_BASELINE_Y - BACK_H1_AMP; // = 68
+const MID_GRAD_TOP  = MID_BASELINE_Y  - MID_H1_AMP;  // = 96
+const FORE_GRAD_TOP = FORE_BASELINE_Y - FORE_H1_AMP; // = 142
 
 type Props = {
   voiceEnergy: SharedValue<number>;
 };
 
 export function BlobShape({ voiceEnergy }: Props) {
-  const leftPath   = useMemo(() => Skia.Path.MakeFromSVGString(LEFT_PATH)!,   []);
-  const centerPath = useMemo(() => Skia.Path.MakeFromSVGString(CENTER_PATH)!, []);
-  const rightPath  = useMemo(() => Skia.Path.MakeFromSVGString(RIGHT_PATH)!,  []);
-
   // UI-thread clock + per-frame envelope followers.
-  const time     = useSharedValue(0);
-  const lowEnv   = useSharedValue(0);
-  const midEnv   = useSharedValue(0);
-  const highEnv  = useSharedValue(0);
-  const lastE    = useSharedValue(0);
+  const time    = useSharedValue(0);
+  const lowEnv  = useSharedValue(0);
+  const midEnv  = useSharedValue(0);
+  const highEnv = useSharedValue(0);
+  const lastE   = useSharedValue(0);
 
   useFrameCallback((info) => {
     'worklet';
     const e = voiceEnergy.value;
 
-    lowEnv.value  = lowEnv.value * (1 - LOW_LERP)  + e * LOW_LERP;
-    midEnv.value  = midEnv.value * (1 - MID_LERP)  + e * MID_LERP;
+    lowEnv.value = lowEnv.value * (1 - LOW_LERP) + e * LOW_LERP;
+    midEnv.value = midEnv.value * (1 - MID_LERP) + e * MID_LERP;
 
     const delta = Math.max(0, e - lastE.value);
     highEnv.value = Math.max(highEnv.value * HIGH_DECAY, delta * HIGH_GAIN);
@@ -181,137 +231,166 @@ export function BlobShape({ voiceEnergy }: Props) {
     time.value = info.timestamp / 1000;
   });
 
-  // Per-shape breath — same waveform shape, different phase each.
-  const leftBreath = useDerivedValue(() =>
-    1 + BREATH_AMP + BREATH_AMP * Math.sin(
-      (TWO_PI * time.value) / BREATH_PERIOD + BREATH_PHASE_LEFT,
-    ),
-  );
-  const centerBreath = useDerivedValue(() =>
-    1 + BREATH_AMP + BREATH_AMP * Math.sin(
-      (TWO_PI * time.value) / BREATH_PERIOD + BREATH_PHASE_CENTER,
-    ),
-  );
-  const rightBreath = useDerivedValue(() =>
-    1 + BREATH_AMP + BREATH_AMP * Math.sin(
-      (TWO_PI * time.value) / BREATH_PERIOD + BREATH_PHASE_RIGHT,
-    ),
-  );
+  // One fresh SkPath per layer per frame, built procedurally on the UI thread.
+  const backPath = useDerivedValue(() => {
+    'worklet';
+    return buildWavePath(
+      time.value, lowEnv.value, BACK_BASELINE_Y, BACK_HARMONICS,
+      BACK_H1_AMP, BACK_VOICE_GAIN,
+    );
+  });
 
-  // Per-shape vertical bob — small screen-space drift.
-  const leftBob = useDerivedValue(() =>
-    BOB_AMP * Math.sin((TWO_PI * time.value) / BOB_PERIOD + BOB_PHASE_LEFT),
-  );
-  const centerBob = useDerivedValue(() =>
-    BOB_AMP * Math.sin((TWO_PI * time.value) / BOB_PERIOD + BOB_PHASE_CENTER),
-  );
-  const rightBob = useDerivedValue(() =>
-    BOB_AMP * Math.sin((TWO_PI * time.value) / BOB_PERIOD + BOB_PHASE_RIGHT),
-  );
+  const midPath = useDerivedValue(() => {
+    'worklet';
+    return buildWavePath(
+      time.value, midEnv.value, MID_BASELINE_Y, MID_HARMONICS,
+      MID_H1_AMP, MID_VOICE_GAIN,
+    );
+  });
 
-  // Per-shape rotation (radians). Sign of period sets direction.
-  const leftRot   = useDerivedValue(() => (TWO_PI * time.value) / ROT_PERIOD_LEFT);
-  const centerRot = useDerivedValue(() => (TWO_PI * time.value) / ROT_PERIOD_CENTER);
-  const rightRot  = useDerivedValue(() => (TWO_PI * time.value) / ROT_PERIOD_RIGHT);
+  const forePath = useDerivedValue(() => {
+    'worklet';
+    return buildWavePath(
+      time.value, highEnv.value, FORE_BASELINE_Y, FORE_HARMONICS,
+      FORE_H1_AMP, FORE_VOICE_GAIN,
+    );
+  });
 
-  // Per-shape scales: own breath + band-specific voice response.
-  const leftScale   = useDerivedValue(() => leftBreath.value   + lowEnv.value  * LEFT_VOICE);
-  const centerScale = useDerivedValue(() => centerBreath.value + midEnv.value  * CENTER_VOICE);
-  const rightScale  = useDerivedValue(() => rightBreath.value  + highEnv.value * RIGHT_VOICE);
-
-  // Skia transforms — applied last-to-first to each point. Reading bottom-up:
-  //   • move shape's centre to the origin
-  //   • scale around the origin
-  //   • rotate around the origin (so spin pivots on the shape's centre)
-  //   • translate the shape back to its frame-local position, plus the bob
-  const leftTransform = useDerivedValue(() => [
-    { translateX: LEFT_X + LEFT_CX },
-    { translateY: LEFT_Y + LEFT_CY + leftBob.value },
-    { rotate:     leftRot.value },
-    { scale:      leftScale.value },
-    { translateX: -LEFT_CX },
-    { translateY: -LEFT_CY },
-  ]);
-  const centerTransform = useDerivedValue(() => [
-    { translateX: CENTER_X + CENTER_CX },
-    { translateY: CENTER_Y + CENTER_CY + centerBob.value },
-    { rotate:     centerRot.value },
-    { scale:      centerScale.value },
-    { translateX: -CENTER_CX },
-    { translateY: -CENTER_CY },
-  ]);
-  const rightTransform = useDerivedValue(() => [
-    { translateX: RIGHT_X + RIGHT_CX },
-    { translateY: RIGHT_Y + RIGHT_CY + rightBob.value },
-    { rotate:     rightRot.value },
-    { scale:      rightScale.value },
-    { translateX: -RIGHT_CX },
-    { translateY: -RIGHT_CY },
-  ]);
+  // Per-layer gradient endpoints — wave crest (50% alpha) → canvas bottom (10%).
+  const backGradStart  = useMemo(() => vec(0, BACK_GRAD_TOP),  []);
+  const midGradStart   = useMemo(() => vec(0, MID_GRAD_TOP),   []);
+  const foreGradStart  = useMemo(() => vec(0, FORE_GRAD_TOP),  []);
+  const gradEnd        = useMemo(() => vec(0, WAVE_HEIGHT),    []);
 
   return (
-    <View
-      pointerEvents="none"
-      style={[
-        styles.canvas,
-        {
-          left:   CANVAS_LEFT,
-          top:    CANVAS_TOP,
-          width:  CANVAS_W,
-          height: CANVAS_H,
-        },
-      ]}
-    >
-      <Canvas style={StyleSheet.absoluteFill}>
-        {/* Outer Group offsets the Figma frame inside the padded canvas, so
-            shape coordinates below stay frame-local and screen positioning
-            still matches Figma. */}
-        <Group transform={[
-          { translateX: CANVAS_PAD },
-          { translateY: CANVAS_PAD },
-        ]}>
-          {/* Left — coral */}
-          <Group transform={leftTransform}>
-            <Path path={leftPath}>
-              <LinearGradient
-                start={vec(217.431, -101.467)}
-                end={vec(216.199, 247.604)}
-                colors={['#FF8547', 'rgba(255,133,71,0.1)']}
-                positions={[0, 0.844]}
-              />
+    <View pointerEvents="none" style={styles.container}>
+      <Canvas style={styles.canvas}>
+        <Group opacity={LAYER_OPACITY}>
+          {/* Back — bloom halo, then main wave */}
+          <Group opacity={BLOOM_OPACITY}>
+            <Path path={backPath}>
+              <LinearGradient start={backGradStart} end={gradEnd} colors={GRAD_COLORS} />
+              <BlurMask blur={BLOOM_BLUR} style="normal" />
             </Path>
           </Group>
+          <Path path={backPath}>
+            <LinearGradient start={backGradStart} end={gradEnd} colors={GRAD_COLORS} />
+            <BlurMask blur={EDGE_BLUR} style="normal" />
+          </Path>
 
-          {/* Center — peach */}
-          <Group transform={centerTransform}>
-            <Path path={centerPath}>
-              <LinearGradient
-                start={vec(33.864, 46.807)}
-                end={vec(142.253, 266.343)}
-                colors={['rgba(255,87,0,0.4)', 'rgba(255,87,0,0.1)']}
-              />
+          {/* Mid — bloom halo, then main wave */}
+          <Group opacity={BLOOM_OPACITY}>
+            <Path path={midPath}>
+              <LinearGradient start={midGradStart} end={gradEnd} colors={GRAD_COLORS} />
+              <BlurMask blur={BLOOM_BLUR} style="normal" />
             </Path>
           </Group>
+          <Path path={midPath}>
+            <LinearGradient start={midGradStart} end={gradEnd} colors={GRAD_COLORS} />
+            <BlurMask blur={EDGE_BLUR} style="normal" />
+          </Path>
 
-          {/* Right — warm yellow */}
-          <Group transform={rightTransform}>
-            <Path path={rightPath}>
-              <LinearGradient
-                start={vec(124.411, -101.467)}
-                end={vec(125.643, 247.604)}
-                colors={['#FBBF24', 'rgba(251,191,36,0.1)']}
-                positions={[0, 0.844]}
-              />
+          {/* Fore — bloom halo, then main wave */}
+          <Group opacity={BLOOM_OPACITY}>
+            <Path path={forePath}>
+              <LinearGradient start={foreGradStart} end={gradEnd} colors={GRAD_COLORS} />
+              <BlurMask blur={BLOOM_BLUR} style="normal" />
             </Path>
           </Group>
+          <Path path={forePath}>
+            <LinearGradient start={foreGradStart} end={gradEnd} colors={GRAD_COLORS} />
+            <BlurMask blur={EDGE_BLUR} style="normal" />
+          </Path>
         </Group>
       </Canvas>
     </View>
   );
 }
 
+/**
+ * Pure worklet helper — builds a closed Skia path for one wave layer using
+ * cubic Bezier segments derived from sampled wave points (Catmull-Rom-style
+ * tangents). At even spacing dx, the conversion is:
+ *
+ *    c1 = P[i]   + ( P[i+1] - P[i-1] ) / 6
+ *    c2 = P[i+1] - ( P[i+2] - P[i]   ) / 6
+ *
+ * Endpoint tangents reuse the boundary point (zero-derivative falloff), which
+ * is visually indistinguishable from a true natural spline at the screen
+ * edges.
+ */
+function buildWavePath(
+  t: number,
+  bandEnv: number,
+  baseline: number,
+  H: LayerHarmonics,
+  h1Amp: number,
+  voiceGain: number,
+) {
+  'worklet';
+  const a1a = h1Amp * H1_SPLIT_A;
+  const a1b = h1Amp * H1_SPLIT_B;
+
+  const W = SCREEN_W;
+  const dx = W / (SAMPLE_COUNT - 1);
+
+  // Sample y(x, t) across the screen.
+  const ys: number[] = [];
+  for (let i = 0; i < SAMPLE_COUNT; i++) {
+    const u = i / (SAMPLE_COUNT - 1);
+
+    // Centred non-negative voice swell. bell goes 0→1→0 across the width;
+    // the cosine ripple is centred on u = 0.5 so the whole shape is symmetric.
+    // (1 + amp·cos) stays > 0 for amp < 1, so voiceLift is ≥ 0 everywhere.
+    const bell      = Math.pow(Math.sin(Math.PI * u), BELL_POWER);
+    const ripple    = Math.cos(TWO_PI * VOICE_RIPPLE_K * (u - 0.5));
+    const voiceLift = bandEnv * voiceGain * bell * (1 + VOICE_RIPPLE_AMP * ripple);
+
+    const y = baseline
+      - a1a * Math.sin(TWO_PI * H.h1a.k * u + H.h1a.omega * t + H.h1a.phase)
+      - a1b * Math.sin(TWO_PI * H.h1b.k * u + H.h1b.omega * t + H.h1b.phase)
+      - voiceLift;
+    ys.push(y);
+  }
+
+  const path = Skia.Path.Make();
+  path.moveTo(0, ys[0]);
+
+  // Catmull-Rom-to-Bezier between every adjacent pair of sample points.
+  for (let i = 0; i < SAMPLE_COUNT - 1; i++) {
+    const xCurr = i * dx;
+    const xNext = (i + 1) * dx;
+
+    const yPrev  = i > 0                     ? ys[i - 1] : ys[i];
+    const yCurr  = ys[i];
+    const yNext  = ys[i + 1];
+    const yAfter = (i + 2 < SAMPLE_COUNT)    ? ys[i + 2] : ys[i + 1];
+
+    const c1x = xCurr + dx / 3;
+    const c1y = yCurr + (yNext - yPrev) / 6;
+    const c2x = xNext - dx / 3;
+    const c2y = yNext - (yAfter - yCurr) / 6;
+
+    path.cubicTo(c1x, c1y, c2x, c2y, xNext, yNext);
+  }
+
+  // Close down the right edge, across the bottom, and back up the left.
+  path.lineTo(W, WAVE_HEIGHT);
+  path.lineTo(0, WAVE_HEIGHT);
+  path.close();
+
+  return path;
+}
+
 const styles = StyleSheet.create({
-  canvas: {
+  container: {
     position: 'absolute',
+    left:   0,
+    right:  0,
+    bottom: 0,
+    height: WAVE_HEIGHT,
+  },
+  canvas: {
+    flex: 1,
   },
 });
