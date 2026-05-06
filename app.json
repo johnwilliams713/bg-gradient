@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "bg-gradient",
+    "name": "Reba",
     "slug": "bg-gradient",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -35,7 +35,8 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "expo-speech-recognition"
+      "expo-speech-recognition",
+      "./plugins/withReboltIosIcon.js"
     ]
   }
 }

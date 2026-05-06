@@ -1,5 +1,5 @@
 import { StatusBar } from 'expo-status-bar';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
@@ -9,9 +9,17 @@ import {
   Text,
   View,
 } from 'react-native';
+import Animated, {
+  interpolate,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
+import { VOICE_CHROME_DURATION_MS, VOICE_CHROME_EASING } from './constants/voiceChrome';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { BlobShape } from './components/BlobShape';
 import { BottomAppCluster } from './components/BottomAppCluster';
+import { VoiceModeBottomBar } from './components/VoiceModeBottomBar';
 import { useAudioSnippet } from './hooks/useAudioSnippet';
 import { useVoiceComposer } from './hooks/useVoiceComposer';
 import { PALETTE } from './constants/palette';
@@ -26,8 +34,11 @@ const VOICE_ACK =
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState('');
+  const [voiceSessionActive, setVoiceSessionActive] = useState(false);
+  const voiceChromeProgress = useSharedValue(0);
 
   const handleSessionEnd = useCallback((lastTranscript: string) => {
+    setVoiceSessionActive(false);
     const t = lastTranscript.trim();
     if (!t) return;
     const id = `${Date.now()}`;
@@ -39,10 +50,56 @@ export default function App() {
     setDraft('');
   }, []);
 
-  const { listening, voiceEnergy, toggleMic, voiceAvailable } = useVoiceComposer({
+  const {
+    listening,
+    muted,
+    speechPickedUp,
+    voiceEnergy,
+    voiceAvailable,
+    startListening,
+    toggleMute,
+    endVoiceSession,
+  } = useVoiceComposer({
     onTranscript: setDraft,
     onSessionEnd: handleSessionEnd,
   });
+
+  useEffect(() => {
+    voiceChromeProgress.value = withTiming(voiceSessionActive ? 1 : 0, {
+      duration: VOICE_CHROME_DURATION_MS,
+      easing: VOICE_CHROME_EASING,
+    });
+  }, [voiceSessionActive]);
+
+  const enterVoiceMode = useCallback(async () => {
+    setVoiceSessionActive(true);
+    const ok = await startListening();
+    if (!ok) {
+      setVoiceSessionActive(false);
+    }
+  }, [startListening]);
+
+  const handleStopVoiceMode = useCallback(() => {
+    endVoiceSession(draft);
+  }, [draft, endVoiceSession]);
+
+  const chatChromeStyle = useAnimatedStyle(() => ({
+    transform: [
+      {
+        translateY: interpolate(voiceChromeProgress.value, [0, 1], [0, 220]),
+      },
+    ],
+    opacity: interpolate(voiceChromeProgress.value, [0, 1], [1, 0]),
+  }));
+
+  const voiceChromeStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(voiceChromeProgress.value, [0, 1], [0, 1]),
+    transform: [
+      {
+        translateY: interpolate(voiceChromeProgress.value, [0, 1], [140, 0]),
+      },
+    ],
+  }));
 
   const handleSendText = useCallback((text: string) => {
     const id = `${Date.now()}`;
@@ -66,7 +123,10 @@ export default function App() {
   return (
     <SafeAreaProvider style={styles.appBackground}>
       {/* Skia blob — peeks 50 % above screen bottom, reacts to voice */}
-      <BlobShape voiceEnergy={voiceEnergy} listening={listening} />
+      <BlobShape
+        voiceEnergy={voiceEnergy}
+        voiceChromeProgress={voiceChromeProgress}
+      />
 
       <SafeAreaView style={styles.root} edges={['top']}>
         <StatusBar style="dark" />
@@ -88,44 +148,71 @@ export default function App() {
           </View>
 
           {/* Thread */}
-          <ScrollView
-            style={styles.thread}
-            contentContainerStyle={styles.threadContent}
-            keyboardShouldPersistTaps="handled"
-            showsVerticalScrollIndicator={false}
-          >
-            {messages.map((m) => (
-              <View
-                key={m.id}
-                style={[
-                  styles.messageRow,
-                  m.role === 'user' && styles.messageRowUser,
-                ]}
-              >
-                {m.role === 'assistant' ? (
-                  <View style={styles.assistantBlock}>
-                    <Text style={styles.assistantLabel}>Claude</Text>
-                    <Text style={styles.messageText}>{m.text}</Text>
-                  </View>
-                ) : (
-                  <View style={styles.userBubble}>
-                    <Text style={styles.userText}>{m.text}</Text>
-                  </View>
-                )}
+          <View style={styles.threadWrap}>
+            <ScrollView
+              style={styles.thread}
+              contentContainerStyle={styles.threadContent}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              {messages.map((m) => (
+                <View
+                  key={m.id}
+                  style={[
+                    styles.messageRow,
+                    m.role === 'user' && styles.messageRowUser,
+                  ]}
+                >
+                  {m.role === 'assistant' ? (
+                    <View style={styles.assistantBlock}>
+                      <Text style={styles.assistantLabel}>Claude</Text>
+                      <Text style={styles.messageText}>{m.text}</Text>
+                    </View>
+                  ) : (
+                    <View style={styles.userBubble}>
+                      <Text style={styles.userText}>{m.text}</Text>
+                    </View>
+                  )}
+                </View>
+              ))}
+            </ScrollView>
+            {voiceSessionActive && !speechPickedUp ? (
+              <View style={styles.voiceCueOverlay} pointerEvents="none">
+                <Text style={styles.voiceCueText}>Start Talking</Text>
               </View>
-            ))}
-          </ScrollView>
+            ) : null}
+          </View>
 
-          <BottomAppCluster
-            value={draft}
-            onChangeText={setDraft}
-            listening={listening}
-            voiceAvailable={voiceAvailable}
-            onVoicePress={toggleMic}
-            onSend={handleSendText}
-            snippetState={snippetState}
-            onMicSnippetPress={toggleSnippet}
-          />
+          <View style={styles.bottomChrome}>
+            <Animated.View
+              style={chatChromeStyle}
+              pointerEvents={voiceSessionActive ? 'none' : 'auto'}
+            >
+              <BottomAppCluster
+                value={draft}
+                onChangeText={setDraft}
+                listening={listening}
+                voiceAvailable={voiceAvailable}
+                onVoicePress={enterVoiceMode}
+                onSend={handleSendText}
+                snippetState={snippetState}
+                onMicSnippetPress={toggleSnippet}
+              />
+            </Animated.View>
+            <Animated.View
+              pointerEvents={voiceSessionActive ? 'box-none' : 'none'}
+              style={[
+                styles.voiceChromeLayer,
+                voiceChromeStyle,
+              ]}
+            >
+              <VoiceModeBottomBar
+                muted={muted}
+                onToggleMute={toggleMute}
+                onStop={handleStopVoiceMode}
+              />
+            </Animated.View>
+          </View>
         </KeyboardAvoidingView>
       </SafeAreaView>
     </SafeAreaProvider>
@@ -177,6 +264,32 @@ const styles = StyleSheet.create({
   },
   headerSpacer: {
     width: 44,
+  },
+  threadWrap: {
+    flex: 1,
+    position: 'relative',
+  },
+  voiceCueOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  voiceCueText: {
+    fontSize: 20,
+    fontWeight: '600',
+    letterSpacing: -0.4,
+    color: 'rgba(26,24,20,0.55)',
+  },
+  bottomChrome: {
+    position: 'relative',
+  },
+  voiceChromeLayer: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    justifyContent: 'flex-end',
   },
   thread: {
     flex: 1,

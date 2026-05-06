@@ -38,15 +38,14 @@
  * stays visually smooth even with a moderate sample count.
  */
 
-import { useEffect, useMemo } from 'react';
+import { useMemo } from 'react';
 import { Dimensions, StyleSheet } from 'react-native';
 import Animated, {
-  Easing,
+  interpolate,
   useAnimatedStyle,
   useDerivedValue,
   useFrameCallback,
   useSharedValue,
-  withTiming,
   type SharedValue,
 } from 'react-native-reanimated';
 import {
@@ -77,8 +76,6 @@ const WAVE_HEIGHT = 400; // canvas height; gives ~100 px headroom above tallest 
 // hiding behind the bottom chat cluster; voice mode eases back to 0 (current
 // placement). 25 % of canvas height matches the design brief.
 const AMBIENT_VERTICAL_NUDGE = WAVE_HEIGHT * 0.25;
-/** ms — slightly longer than opacity/blur so the motion feels gentle */
-const POSITION_SLIDE_MS = 700;
 
 const BACK_HEIGHT = 260;
 const MID_HEIGHT  = 240;
@@ -164,6 +161,12 @@ const FORE_HARMONICS: LayerHarmonics = {
   h1b: { k: 1.5, omega: 0.400, phase: Math.PI / 2  },
 };
 
+// Ambient roll speed per layer (shared clock × scale). Back = slow / “far”,
+// fore = faster / “near” — peaks and troughs shear past each other slightly.
+const PARALLAX_TIME_BACK = 0.78;
+const PARALLAX_TIME_MID  = 1.0;
+const PARALLAX_TIME_FORE = 1.22;
+
 // H1 (rolling-hill) amplitudes per layer in px. H1a / H1b are split 55 / 45:
 // nearly even — H1a is the slow carrier, H1b the visible morphing component,
 // so giving H1b real weight is what makes peaks "shift" instead of just sit.
@@ -193,12 +196,12 @@ const FORE_VOICE_GAIN = 34.5;
 // clamp to white against the app's white background and disappear, so we rely
 // on the gradient's own translucency for the halo to read.
 //
-// Blur amounts crossfade with the listening state: ambient renders 50 % more
-// diffuse so the waves read as a soft backdrop, then sharpen back to their
-// "design" values when the mic is engaged so the audio-reactive swell is
-// crisper and easier to read.
-const EDGE_BLUR_ACTIVE   = 6.4;   // px — main-wave edge softening (mic on)
-const EDGE_BLUR_IDLE     = 12;    // px — main-wave edge softening (ambient)
+// Blur amounts crossfade with voice chrome: ambient = soft backdrop; voice UI =
+// sharper so the audio-reactive swell is easier to read. Timed via
+// `voiceChromeProgress` (same easing/duration as bottom chrome — not `listening`,
+// which starts later when native recognition spins up).
+const EDGE_BLUR_ACTIVE   = 9;   // px — main-wave edge softening (mic on)
+const EDGE_BLUR_IDLE     = 14;    // px — main-wave edge softening (ambient)
 const BLOOM_BLUR_ACTIVE  = 48;    // px — halo width (mic on)
 const BLOOM_BLUR_IDLE    = 90;    // px — halo width (ambient)
 const BLOOM_OPACITY      = 0.4;   // halo strength (0..1)
@@ -222,13 +225,10 @@ const GRAD_COLORS = ['rgba(255,87,0,0.15)', 'rgba(253,230,138,0.40)'];
 // layers; only the colour stops are flipped.
 const GRAD_COLORS_INVERTED = ['rgba(253,230,138,0.40)', 'rgba(255,87,0,0.15)'];
 
-// Container opacity animates between IDLE (ambient) and ACTIVE (mic engaged).
-// The gradient stops already carry their target alpha; this knob fades the
-// whole stack further back when the user isn't talking, then lifts to full
-// strength when listening starts so the audio-reactive swell really pops.
+// Stack opacity + blur track voice chrome (enter/leave voice mode UI) so they
+// stay lock-step with the composer transition.
 const LAYER_OPACITY_IDLE   = 0.5;
 const LAYER_OPACITY_ACTIVE = 1.0;
-const LISTENING_FADE_MS    = 400; // crossfade duration for opacity + blur
 
 const BACK_GRAD_TOP = BACK_BASELINE_Y - BACK_H1_AMP; // = 94
 const MID_GRAD_TOP  = MID_BASELINE_Y  - MID_H1_AMP;  // = 125
@@ -236,11 +236,15 @@ const FORE_GRAD_TOP = FORE_BASELINE_Y - FORE_H1_AMP; // = 173
 
 type Props = {
   voiceEnergy: SharedValue<number>;
-  /** When true, the wave stack fades up to full opacity for emphasis. */
-  listening: boolean;
+  /**
+   * Same 0→1 driver as the bottom chat / voice chrome (`withTiming` in App).
+   * Drives vertical slide, stack opacity, and blur so nothing lags behind
+   * native `listening`.
+   */
+  voiceChromeProgress: SharedValue<number>;
 };
 
-export function BlobShape({ voiceEnergy, listening }: Props) {
+export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
   // UI-thread clock + per-frame envelope followers.
   const time    = useSharedValue(0);
   const lowEnv  = useSharedValue(0);
@@ -248,39 +252,43 @@ export function BlobShape({ voiceEnergy, listening }: Props) {
   const highEnv = useSharedValue(0);
   const lastE   = useSharedValue(0);
 
-  // Reanimated-driven container opacity + per-pass blur, fed straight to
-  // their respective Skia props. All three crossfade together when the
-  // listening state changes.
-  const layerOpacity = useSharedValue(LAYER_OPACITY_IDLE);
-  const edgeBlur     = useSharedValue(EDGE_BLUR_IDLE);
-  const bloomBlur    = useSharedValue(BLOOM_BLUR_IDLE);
-
-  // Vertical slide: ambient = shifted down behind the composer; listening =
-  // slides up to the established voice-mode framing.
-  const translateY = useSharedValue(listening ? 0 : AMBIENT_VERTICAL_NUDGE);
-
-  useEffect(() => {
-    const opts = { duration: LISTENING_FADE_MS, easing: Easing.inOut(Easing.cubic) };
-    layerOpacity.value = withTiming(
-      listening ? LAYER_OPACITY_ACTIVE : LAYER_OPACITY_IDLE, opts,
+  const layerOpacity = useDerivedValue(() => {
+    'worklet';
+    return interpolate(
+      voiceChromeProgress.value,
+      [0, 1],
+      [LAYER_OPACITY_IDLE, LAYER_OPACITY_ACTIVE],
     );
-    edgeBlur.value = withTiming(
-      listening ? EDGE_BLUR_ACTIVE : EDGE_BLUR_IDLE, opts,
-    );
-    bloomBlur.value = withTiming(
-      listening ? BLOOM_BLUR_ACTIVE : BLOOM_BLUR_IDLE, opts,
-    );
-  }, [listening, layerOpacity, edgeBlur, bloomBlur]);
+  });
 
-  useEffect(() => {
-    translateY.value = withTiming(listening ? 0 : AMBIENT_VERTICAL_NUDGE, {
-      duration: POSITION_SLIDE_MS,
-      easing: Easing.inOut(Easing.cubic),
-    });
-  }, [listening, translateY]);
+  const edgeBlur = useDerivedValue(() => {
+    'worklet';
+    return interpolate(
+      voiceChromeProgress.value,
+      [0, 1],
+      [EDGE_BLUR_IDLE, EDGE_BLUR_ACTIVE],
+    );
+  });
+
+  const bloomBlur = useDerivedValue(() => {
+    'worklet';
+    return interpolate(
+      voiceChromeProgress.value,
+      [0, 1],
+      [BLOOM_BLUR_IDLE, BLOOM_BLUR_ACTIVE],
+    );
+  });
 
   const containerStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: translateY.value }],
+    transform: [
+      {
+        translateY: interpolate(
+          voiceChromeProgress.value,
+          [0, 1],
+          [AMBIENT_VERTICAL_NUDGE, 0],
+        ),
+      },
+    ],
   }));
 
   useFrameCallback((info) => {
@@ -301,24 +309,39 @@ export function BlobShape({ voiceEnergy, listening }: Props) {
   const backPath = useDerivedValue(() => {
     'worklet';
     return buildWavePath(
-      time.value, lowEnv.value, BACK_BASELINE_Y, BACK_HARMONICS,
-      BACK_H1_AMP, BACK_VOICE_GAIN,
+      time.value,
+      lowEnv.value,
+      BACK_BASELINE_Y,
+      BACK_HARMONICS,
+      BACK_H1_AMP,
+      BACK_VOICE_GAIN,
+      PARALLAX_TIME_BACK,
     );
   });
 
   const midPath = useDerivedValue(() => {
     'worklet';
     return buildWavePath(
-      time.value, midEnv.value, MID_BASELINE_Y, MID_HARMONICS,
-      MID_H1_AMP, MID_VOICE_GAIN,
+      time.value,
+      midEnv.value,
+      MID_BASELINE_Y,
+      MID_HARMONICS,
+      MID_H1_AMP,
+      MID_VOICE_GAIN,
+      PARALLAX_TIME_MID,
     );
   });
 
   const forePath = useDerivedValue(() => {
     'worklet';
     return buildWavePath(
-      time.value, highEnv.value, FORE_BASELINE_Y, FORE_HARMONICS,
-      FORE_H1_AMP, FORE_VOICE_GAIN,
+      time.value,
+      highEnv.value,
+      FORE_BASELINE_Y,
+      FORE_HARMONICS,
+      FORE_H1_AMP,
+      FORE_VOICE_GAIN,
+      PARALLAX_TIME_FORE,
     );
   });
 
@@ -394,6 +417,9 @@ export function BlobShape({ voiceEnergy, listening }: Props) {
  * Endpoint tangents reuse the boundary point (zero-derivative falloff), which
  * is visually indistinguishable from a true natural spline at the screen
  * edges.
+ *
+ * Swell uses the unscaled clock so voice reactivity stays aligned across layers;
+ * only H₁ ambient sine phases use `ambientTimeScale` for parallax.
  */
 function buildWavePath(
   t: number,
@@ -402,8 +428,10 @@ function buildWavePath(
   H: LayerHarmonics,
   h1Amp: number,
   voiceGain: number,
+  ambientTimeScale: number,
 ) {
   'worklet';
+  const ta = t * ambientTimeScale;
   const a1a = h1Amp * H1_SPLIT_A;
   const a1b = h1Amp * H1_SPLIT_B;
 
@@ -423,8 +451,8 @@ function buildWavePath(
     const voiceLift = bandEnv * voiceGain * bell * (1 + VOICE_RIPPLE_AMP * ripple);
 
     const y = baseline
-      - a1a * Math.sin(TWO_PI * H.h1a.k * u + H.h1a.omega * t + H.h1a.phase)
-      - a1b * Math.sin(TWO_PI * H.h1b.k * u + H.h1b.omega * t + H.h1b.phase)
+      - a1a * Math.sin(TWO_PI * H.h1a.k * u + H.h1a.omega * ta + H.h1a.phase)
+      - a1b * Math.sin(TWO_PI * H.h1b.k * u + H.h1b.omega * ta + H.h1b.phase)
       - voiceLift;
     ys.push(y);
   }

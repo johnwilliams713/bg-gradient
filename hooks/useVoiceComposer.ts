@@ -21,6 +21,17 @@ try {
 const EXPO_GO_NOTICE =
   'Voice input needs a development build.\n\nRun:\n  npx expo run:ios --device\n\nThen open the app from Xcode / Expo CLI instead of Expo Go.';
 
+const START_OPTIONS = {
+  lang: 'en-US',
+  interimResults: true,
+  continuous: true,
+  volumeChangeEventOptions: { enabled: true, intervalMillis: 30 },
+  iosTaskHint: 'dictation' as const,
+};
+
+/** Recognition ended with nothing heard — expected when user stops voice mode without talking. */
+const SILENT_END_ERRORS = new Set<string>(['no-speech', 'speech-timeout']);
+
 function normalizeVolume(raw: number): number {
   if (raw < 0) return 0;
   return Math.min(1, raw / 7);
@@ -38,9 +49,11 @@ export function useVoiceComposer({
   onSessionStart,
 }: Options) {
   const [listening, setListening] = useState(false);
+  const [muted, setMuted] = useState(false);
+  /** User speech observed (native VAD / first partial). Resets each recognition `start`. */
+  const [speechPickedUp, setSpeechPickedUp] = useState(false);
   const voiceEnergy = useSharedValue(0);
 
-  // Stable refs so listeners never go stale
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
   const onSessionEndRef = useRef(onSessionEnd);
@@ -50,18 +63,15 @@ export function useVoiceComposer({
   const transcriptRef = useRef('');
   const listeningRef = useRef(false);
   listeningRef.current = listening;
+  /** When true, the next recognition end must not commit (mic mute used `abort`). */
+  const skipSessionEndRef = useRef(false);
 
-  // Register all native listeners imperatively inside one useEffect so the
-  // hook call-count is always the same whether or not the native module exists.
   useEffect(() => {
     const mod = speechMod?.ExpoSpeechRecognitionModule;
     if (!mod) return; // Expo Go – skip, no-op
 
     const subs = [
       mod.addListener('volumechange', (ev: { value: number }) => {
-        // Ramp toward each new sample over ~90ms so Reanimated interpolates
-        // every display frame between the (slower) audio samples. Linear easing
-        // chains gracefully when interrupted by the next sample.
         voiceEnergy.value = withTiming(normalizeVolume(ev.value), {
           duration: 90,
           easing: Easing.linear,
@@ -69,27 +79,43 @@ export function useVoiceComposer({
       }),
       mod.addListener('start', () => {
         setListening(true);
+        setSpeechPickedUp(false);
         transcriptRef.current = '';
+        onTranscriptRef.current('');
         onSessionStartRef.current?.();
+      }),
+      mod.addListener('speechstart', () => {
+        setSpeechPickedUp(true);
       }),
       mod.addListener('result', (ev: { results: Array<{ transcript: string }> }) => {
         const text = ev.results[0]?.transcript ?? '';
         transcriptRef.current = text;
         onTranscriptRef.current(text);
+        if (text.trim()) {
+          setSpeechPickedUp(true);
+        }
       }),
       mod.addListener('end', () => {
         setListening(false);
         voiceEnergy.value = withTiming(0, { duration: 450 });
         const last = transcriptRef.current;
         transcriptRef.current = '';
+        if (skipSessionEndRef.current) {
+          skipSessionEndRef.current = false;
+          return;
+        }
         onSessionEndRef.current?.(last);
       }),
       mod.addListener('error', (ev: { error: string; message: string }) => {
         setListening(false);
         voiceEnergy.value = withTiming(0, { duration: 250 });
-        if (ev.error !== 'aborted') {
-          Alert.alert('Voice input', ev.message || ev.error);
+        if (ev.error === 'aborted') {
+          return;
         }
+        if (SILENT_END_ERRORS.has(ev.error)) {
+          return;
+        }
+        Alert.alert('Voice input', ev.message || ev.error);
       }),
     ];
 
@@ -101,17 +127,16 @@ export function useVoiceComposer({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const toggleMic = useCallback(async () => {
+  const startListening = useCallback(async (): Promise<boolean> => {
     const mod = speechMod?.ExpoSpeechRecognitionModule;
 
     if (!mod) {
       Alert.alert('Development build required', EXPO_GO_NOTICE);
-      return;
+      return false;
     }
 
     if (listeningRef.current) {
-      mod.stop();
-      return;
+      return true;
     }
 
     const perm = await mod.requestPermissionsAsync();
@@ -120,17 +145,69 @@ export function useVoiceComposer({
         'Microphone & speech',
         'Please allow microphone and speech recognition to use voice input.',
       );
-      return;
+      return false;
     }
 
-    mod.start({
-      lang: 'en-US',
-      interimResults: true,
-      continuous: true,
-      volumeChangeEventOptions: { enabled: true, intervalMillis: 30 },
-      iosTaskHint: 'dictation',
-    });
+    skipSessionEndRef.current = false;
+    mod.start(START_OPTIONS);
+    return true;
   }, []);
 
-  return { listening, voiceEnergy, toggleMic, voiceAvailable: speechMod !== null };
+  /**
+   * Mic off: `abort()` stops capture and STT immediately without committing a turn
+   * (same idea as muting a streaming assistant — no audio processed until unmute).
+   * Unmute starts a fresh recognition session; there is no engine-level “pause” in
+   * expo-speech-recognition.
+   */
+  const muteRecognition = useCallback(() => {
+    const mod = speechMod?.ExpoSpeechRecognitionModule;
+    if (!mod || !listeningRef.current) return;
+    skipSessionEndRef.current = true;
+    mod.abort();
+    setMuted(true);
+    voiceEnergy.value = withTiming(0, { duration: 200 });
+  }, [voiceEnergy]);
+
+  const unmuteRecognition = useCallback(async () => {
+    const ok = await startListening();
+    if (ok) {
+      setMuted(false);
+    }
+  }, [startListening]);
+
+  const toggleMute = useCallback(() => {
+    if (muted) {
+      void unmuteRecognition();
+    } else {
+      muteRecognition();
+    }
+  }, [muted, muteRecognition, unmuteRecognition]);
+
+  /**
+   * End the voice-mode session from the Stop control.
+   * If recognition is active, `stop()` commits a final transcript via the `end` event.
+   * If muted (no active session), commit synchronously using the ref or fallback.
+   */
+  const endVoiceSession = useCallback((fallbackTranscript = '') => {
+    const mod = speechMod?.ExpoSpeechRecognitionModule;
+    setMuted(false);
+    if (listeningRef.current && mod) {
+      mod.stop();
+      return;
+    }
+    const last = transcriptRef.current || fallbackTranscript;
+    transcriptRef.current = '';
+    onSessionEndRef.current?.(last);
+  }, []);
+
+  return {
+    listening,
+    muted,
+    speechPickedUp,
+    voiceEnergy,
+    startListening,
+    toggleMute,
+    endVoiceSession,
+    voiceAvailable: speechMod !== null,
+  };
 }

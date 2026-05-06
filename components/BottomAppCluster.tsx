@@ -23,7 +23,7 @@ import type { SnippetState } from '../hooks/useAudioSnippet';
  *
  *  Right action button
  *  ──────────────────────
- *    • Default (no draft text):  black bg (#0a0a0a), AudioLines icon → toggleMic()
+ *    • Default (no draft text):  black bg (#0a0a0a), AudioLines icon → voice mode
  *    • Draft non-empty:          orange bg (#FF5700),  ArrowUp icon  → onSend()
  *
  *  Mic button (middle-right) — Claude-style audio snippet recorder. Three
