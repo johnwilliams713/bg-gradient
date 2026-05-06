@@ -11,9 +11,12 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { BlobShape } from './components/BlobShape';
-import { AnimatedMeshFooter } from './components/AnimatedMeshFooter';
+import { BottomAppCluster } from './components/BottomAppCluster';
+import { useAudioSnippet } from './hooks/useAudioSnippet';
 import { useVoiceComposer } from './hooks/useVoiceComposer';
 import { PALETTE } from './constants/palette';
+
+const OPENAI_API_KEY = process.env.EXPO_PUBLIC_OPENAI_API_KEY;
 
 type Message = { id: string; role: 'user' | 'assistant'; text: string };
 
@@ -41,10 +44,29 @@ export default function App() {
     onSessionEnd: handleSessionEnd,
   });
 
+  const handleSendText = useCallback((text: string) => {
+    const id = `${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      { id: `u-${id}`, role: 'user', text },
+      { id: `a-${id}`, role: 'assistant', text: VOICE_ACK },
+    ]);
+    setDraft('');
+  }, []);
+
+  const handleSnippetTranscript = useCallback((text: string) => {
+    setDraft((prev) => (prev.trim() ? `${prev.trimEnd()} ${text}` : text));
+  }, []);
+
+  const { state: snippetState, toggle: toggleSnippet } = useAudioSnippet({
+    onTranscript: handleSnippetTranscript,
+    apiKey: OPENAI_API_KEY,
+  });
+
   return (
-    <SafeAreaProvider>
+    <SafeAreaProvider style={styles.appBackground}>
       {/* Skia blob — peeks 50 % above screen bottom, reacts to voice */}
-      <BlobShape voiceEnergy={voiceEnergy} />
+      <BlobShape voiceEnergy={voiceEnergy} listening={listening} />
 
       <SafeAreaView style={styles.root} edges={['top']}>
         <StatusBar style="dark" />
@@ -94,14 +116,15 @@ export default function App() {
             ))}
           </ScrollView>
 
-          {/* Frosted-glass composer */}
-          <AnimatedMeshFooter
+          <BottomAppCluster
             value={draft}
             onChangeText={setDraft}
-            voiceEnergy={voiceEnergy}
             listening={listening}
-            onMicPress={toggleMic}
             voiceAvailable={voiceAvailable}
+            onVoicePress={toggleMic}
+            onSend={handleSendText}
+            snippetState={snippetState}
+            onMicSnippetPress={toggleSnippet}
           />
         </KeyboardAvoidingView>
       </SafeAreaView>
@@ -110,6 +133,10 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
+  appBackground: {
+    flex: 1,
+    backgroundColor: PALETTE.canvas,
+  },
   root: {
     flex: 1,
     backgroundColor: 'transparent',

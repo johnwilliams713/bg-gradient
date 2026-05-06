@@ -38,12 +38,15 @@
  * stays visually smooth even with a moderate sample count.
  */
 
-import { useMemo } from 'react';
-import { Dimensions, StyleSheet, View } from 'react-native';
-import {
+import { useEffect, useMemo } from 'react';
+import { Dimensions, StyleSheet } from 'react-native';
+import Animated, {
+  Easing,
+  useAnimatedStyle,
   useDerivedValue,
   useFrameCallback,
   useSharedValue,
+  withTiming,
   type SharedValue,
 } from 'react-native-reanimated';
 import {
@@ -70,13 +73,20 @@ const { width: SCREEN_W } = Dimensions.get('window');
 
 const WAVE_HEIGHT = 400; // canvas height; gives ~100 px headroom above tallest baseline for voice ripples
 
-const BACK_HEIGHT = 300;
-const MID_HEIGHT  = 280;
-const FORE_HEIGHT = 240;
+// In ambient mode the whole canvas sits this many px lower so waves read as
+// hiding behind the bottom chat cluster; voice mode eases back to 0 (current
+// placement). 25 % of canvas height matches the design brief.
+const AMBIENT_VERTICAL_NUDGE = WAVE_HEIGHT * 0.25;
+/** ms — slightly longer than opacity/blur so the motion feels gentle */
+const POSITION_SLIDE_MS = 700;
 
-const BACK_BASELINE_Y = WAVE_HEIGHT - BACK_HEIGHT; // 100
-const MID_BASELINE_Y  = WAVE_HEIGHT - MID_HEIGHT;  // 120
-const FORE_BASELINE_Y = WAVE_HEIGHT - FORE_HEIGHT; // 160
+const BACK_HEIGHT = 260;
+const MID_HEIGHT  = 240;
+const FORE_HEIGHT = 200;
+
+const BACK_BASELINE_Y = WAVE_HEIGHT - BACK_HEIGHT; // 140
+const MID_BASELINE_Y  = WAVE_HEIGHT - MID_HEIGHT;  // 160
+const FORE_BASELINE_Y = WAVE_HEIGHT - FORE_HEIGHT; // 200
 
 // Path resolution. With cubic-Bezier smoothing, even modest sample counts read
 // as fully smooth; 48 leaves plenty of headroom for the voice H3 ripples
@@ -140,36 +150,37 @@ type LayerHarmonics = {
 };
 
 const BACK_HARMONICS: LayerHarmonics = {
-  h1a: { k: 1.0, omega: 0.08, phase: 0           },
-  h1b: { k: 1.3, omega: 0.13, phase: Math.PI / 5 },
+  h1a: { k: 1.0, omega: 0.200, phase: 0           },
+  h1b: { k: 1.3, omega: 0.330, phase: Math.PI / 5 },
 };
 
 const MID_HARMONICS: LayerHarmonics = {
-  h1a: { k: 1.1, omega: 0.10, phase: Math.PI / 7 },
-  h1b: { k: 1.4, omega: 0.07, phase: Math.PI / 3 },
+  h1a: { k: 1.1, omega: 0.250, phase: Math.PI / 7 },
+  h1b: { k: 1.4, omega: 0.175, phase: Math.PI / 3 },
 };
 
 const FORE_HARMONICS: LayerHarmonics = {
-  h1a: { k: 1.2, omega: 0.12, phase: Math.PI / 11 },
-  h1b: { k: 1.5, omega: 0.16, phase: Math.PI / 2  },
+  h1a: { k: 1.2, omega: 0.300, phase: Math.PI / 11 },
+  h1b: { k: 1.5, omega: 0.400, phase: Math.PI / 2  },
 };
 
-// H1 (rolling-hill) amplitudes per layer in px. H1a / H1b are split 70 / 30:
-// H1a dominates for a calm shape, H1b adds gentle in-place morphing.
-const BACK_H1_AMP = 32;
-const MID_H1_AMP  = 24;
-const FORE_H1_AMP = 18;
+// H1 (rolling-hill) amplitudes per layer in px. H1a / H1b are split 55 / 45:
+// nearly even — H1a is the slow carrier, H1b the visible morphing component,
+// so giving H1b real weight is what makes peaks "shift" instead of just sit.
+const BACK_H1_AMP = 46;
+const MID_H1_AMP  = 35;
+const FORE_H1_AMP = 27;
 
-const H1_SPLIT_A = 0.7;
-const H1_SPLIT_B = 0.3;
+const H1_SPLIT_A = 0.55;
+const H1_SPLIT_B = 0.45;
 
 // Per-layer voice swell amplitude (px). At bandEnv = 1 and the voice shape's
 // peak (u = 0.5), the wave is pushed up by VOICE_GAIN · (1 + VOICE_RIPPLE_AMP)
 // pixels. With BACK_VOICE_GAIN = 50 and RIPPLE_AMP = 0.35, that's ~67 px max
 // — comfortably within the canvas headroom above each baseline.
-const BACK_VOICE_GAIN = 50;
-const MID_VOICE_GAIN  = 40;
-const FORE_VOICE_GAIN = 30;
+const BACK_VOICE_GAIN = 57.5;
+const MID_VOICE_GAIN  = 46;
+const FORE_VOICE_GAIN = 34.5;
 
 // ─── Bloom + edge softening ──────────────────────────────────────────────────
 //
@@ -181,41 +192,96 @@ const FORE_VOICE_GAIN = 30;
 // Standard alpha blending (no blendMode change) — additive blends would just
 // clamp to white against the app's white background and disappear, so we rely
 // on the gradient's own translucency for the halo to read.
-const EDGE_BLUR     = 3;     // px — subtle softening of the main wave's edges
-const BLOOM_BLUR    = 30;    // px — width of the soft halo around each wave
-const BLOOM_OPACITY = 0.4;   // halo strength (0..1)
+//
+// Blur amounts crossfade with the listening state: ambient renders 50 % more
+// diffuse so the waves read as a soft backdrop, then sharpen back to their
+// "design" values when the mic is engaged so the audio-reactive swell is
+// crisper and easier to read.
+const EDGE_BLUR_ACTIVE   = 6.4;   // px — main-wave edge softening (mic on)
+const EDGE_BLUR_IDLE     = 12;    // px — main-wave edge softening (ambient)
+const BLOOM_BLUR_ACTIVE  = 48;    // px — halo width (mic on)
+const BLOOM_BLUR_IDLE    = 90;    // px — halo width (ambient)
+const BLOOM_OPACITY      = 0.4;   // halo strength (0..1)
 
 // ─── Gradient ────────────────────────────────────────────────────────────────
 //
 // Two-stop warm gradient shared by all three layers (Figma node 11144:17634):
-// FF5700 (orange-red) at the wave's crest, fading to FBBF24 (warm yellow) at
-// the canvas bottom. Stops are full-alpha; overall transparency comes from
-// LAYER_OPACITY below — matching the Figma "100% / 100% stops, 20% layer
-// opacity" setup.
+// FF5700 (orange-red) at the wave's crest, fading to FDE68A (warm yellow) at
+// the canvas bottom. Per-stop alphas (15 % top, 40 % bottom) match the Figma
+// fill exactly, so the layer Group itself runs at full opacity. Each layer is
+// drawn with the "multiply" blend mode so overlapping waves darken naturally
+// against the cream page background — visually close to Figma's "Plus Darker"
+// for our warm-on-cream palette. (Skia ≥ 2.5 supports a true `plusDarker`
+// blend mode but Expo SDK 54 currently blesses Skia 2.2.x, which doesn't.)
 
-const GRAD_COLORS = ['#FF5700', '#FBBF24'];
+const GRAD_COLORS = ['rgba(255,87,0,0.15)', 'rgba(253,230,138,0.40)'];
 
-// Overall opacity applied to the entire wave composition (all three layers,
-// bloom + main). Multiplies through to give effective per-pixel alpha, so
-// reducing this is the cheapest way to dial saturation up or down without
-// touching gradients or bloom values individually.
-const LAYER_OPACITY = 0.2;
+// Mid layer is the visual counter-tone — its gradient stops are inverted
+// (yellow on top, orange on the bottom) in BOTH idle and listening states.
+// Blur and bloom on mid follow the same idle/active animation as the other
+// layers; only the colour stops are flipped.
+const GRAD_COLORS_INVERTED = ['rgba(253,230,138,0.40)', 'rgba(255,87,0,0.15)'];
 
-const BACK_GRAD_TOP = BACK_BASELINE_Y - BACK_H1_AMP; // = 68
-const MID_GRAD_TOP  = MID_BASELINE_Y  - MID_H1_AMP;  // = 96
-const FORE_GRAD_TOP = FORE_BASELINE_Y - FORE_H1_AMP; // = 142
+// Container opacity animates between IDLE (ambient) and ACTIVE (mic engaged).
+// The gradient stops already carry their target alpha; this knob fades the
+// whole stack further back when the user isn't talking, then lifts to full
+// strength when listening starts so the audio-reactive swell really pops.
+const LAYER_OPACITY_IDLE   = 0.5;
+const LAYER_OPACITY_ACTIVE = 1.0;
+const LISTENING_FADE_MS    = 400; // crossfade duration for opacity + blur
+
+const BACK_GRAD_TOP = BACK_BASELINE_Y - BACK_H1_AMP; // = 94
+const MID_GRAD_TOP  = MID_BASELINE_Y  - MID_H1_AMP;  // = 125
+const FORE_GRAD_TOP = FORE_BASELINE_Y - FORE_H1_AMP; // = 173
 
 type Props = {
   voiceEnergy: SharedValue<number>;
+  /** When true, the wave stack fades up to full opacity for emphasis. */
+  listening: boolean;
 };
 
-export function BlobShape({ voiceEnergy }: Props) {
+export function BlobShape({ voiceEnergy, listening }: Props) {
   // UI-thread clock + per-frame envelope followers.
   const time    = useSharedValue(0);
   const lowEnv  = useSharedValue(0);
   const midEnv  = useSharedValue(0);
   const highEnv = useSharedValue(0);
   const lastE   = useSharedValue(0);
+
+  // Reanimated-driven container opacity + per-pass blur, fed straight to
+  // their respective Skia props. All three crossfade together when the
+  // listening state changes.
+  const layerOpacity = useSharedValue(LAYER_OPACITY_IDLE);
+  const edgeBlur     = useSharedValue(EDGE_BLUR_IDLE);
+  const bloomBlur    = useSharedValue(BLOOM_BLUR_IDLE);
+
+  // Vertical slide: ambient = shifted down behind the composer; listening =
+  // slides up to the established voice-mode framing.
+  const translateY = useSharedValue(listening ? 0 : AMBIENT_VERTICAL_NUDGE);
+
+  useEffect(() => {
+    const opts = { duration: LISTENING_FADE_MS, easing: Easing.inOut(Easing.cubic) };
+    layerOpacity.value = withTiming(
+      listening ? LAYER_OPACITY_ACTIVE : LAYER_OPACITY_IDLE, opts,
+    );
+    edgeBlur.value = withTiming(
+      listening ? EDGE_BLUR_ACTIVE : EDGE_BLUR_IDLE, opts,
+    );
+    bloomBlur.value = withTiming(
+      listening ? BLOOM_BLUR_ACTIVE : BLOOM_BLUR_IDLE, opts,
+    );
+  }, [listening, layerOpacity, edgeBlur, bloomBlur]);
+
+  useEffect(() => {
+    translateY.value = withTiming(listening ? 0 : AMBIENT_VERTICAL_NUDGE, {
+      duration: POSITION_SLIDE_MS,
+      easing: Easing.inOut(Easing.cubic),
+    });
+  }, [listening, translateY]);
+
+  const containerStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: translateY.value }],
+  }));
 
   useFrameCallback((info) => {
     'worklet';
@@ -263,47 +329,57 @@ export function BlobShape({ voiceEnergy }: Props) {
   const gradEnd        = useMemo(() => vec(0, WAVE_HEIGHT),    []);
 
   return (
-    <View pointerEvents="none" style={styles.container}>
+    <Animated.View
+      pointerEvents="none"
+      style={[styles.container, containerStyle]}
+    >
       <Canvas style={styles.canvas}>
-        <Group opacity={LAYER_OPACITY}>
-          {/* Back — bloom halo, then main wave */}
-          <Group opacity={BLOOM_OPACITY}>
+        <Group opacity={layerOpacity}>
+          {/* Back — bloom halo, then main wave (multiply blend) */}
+          <Group blendMode="multiply">
+            <Group opacity={BLOOM_OPACITY}>
+              <Path path={backPath}>
+                <LinearGradient start={backGradStart} end={gradEnd} colors={GRAD_COLORS} />
+                <BlurMask blur={bloomBlur} style="normal" />
+              </Path>
+            </Group>
             <Path path={backPath}>
               <LinearGradient start={backGradStart} end={gradEnd} colors={GRAD_COLORS} />
-              <BlurMask blur={BLOOM_BLUR} style="normal" />
+              <BlurMask blur={edgeBlur} style="normal" />
             </Path>
           </Group>
-          <Path path={backPath}>
-            <LinearGradient start={backGradStart} end={gradEnd} colors={GRAD_COLORS} />
-            <BlurMask blur={EDGE_BLUR} style="normal" />
-          </Path>
 
-          {/* Mid — bloom halo, then main wave */}
-          <Group opacity={BLOOM_OPACITY}>
+          {/* Mid — inverted gradient, otherwise identical bloom+edge blur
+              treatment as the other layers (multiply blend) */}
+          <Group blendMode="multiply">
+            <Group opacity={BLOOM_OPACITY}>
+              <Path path={midPath}>
+                <LinearGradient start={midGradStart} end={gradEnd} colors={GRAD_COLORS_INVERTED} />
+                <BlurMask blur={bloomBlur} style="normal" />
+              </Path>
+            </Group>
             <Path path={midPath}>
-              <LinearGradient start={midGradStart} end={gradEnd} colors={GRAD_COLORS} />
-              <BlurMask blur={BLOOM_BLUR} style="normal" />
+              <LinearGradient start={midGradStart} end={gradEnd} colors={GRAD_COLORS_INVERTED} />
+              <BlurMask blur={edgeBlur} style="normal" />
             </Path>
           </Group>
-          <Path path={midPath}>
-            <LinearGradient start={midGradStart} end={gradEnd} colors={GRAD_COLORS} />
-            <BlurMask blur={EDGE_BLUR} style="normal" />
-          </Path>
 
-          {/* Fore — bloom halo, then main wave */}
-          <Group opacity={BLOOM_OPACITY}>
+          {/* Fore — bloom halo, then main wave (multiply blend) */}
+          <Group blendMode="multiply">
+            <Group opacity={BLOOM_OPACITY}>
+              <Path path={forePath}>
+                <LinearGradient start={foreGradStart} end={gradEnd} colors={GRAD_COLORS} />
+                <BlurMask blur={bloomBlur} style="normal" />
+              </Path>
+            </Group>
             <Path path={forePath}>
               <LinearGradient start={foreGradStart} end={gradEnd} colors={GRAD_COLORS} />
-              <BlurMask blur={BLOOM_BLUR} style="normal" />
+              <BlurMask blur={edgeBlur} style="normal" />
             </Path>
           </Group>
-          <Path path={forePath}>
-            <LinearGradient start={foreGradStart} end={gradEnd} colors={GRAD_COLORS} />
-            <BlurMask blur={EDGE_BLUR} style="normal" />
-          </Path>
         </Group>
       </Canvas>
-    </View>
+    </Animated.View>
   );
 }
 
