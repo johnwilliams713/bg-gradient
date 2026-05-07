@@ -1,14 +1,6 @@
-import { ArrowUp, AudioLines, Mic, Plus } from 'lucide-react-native';
-import {
-  ActivityIndicator,
-  Pressable,
-  StyleSheet,
-  TextInput,
-  View,
-} from 'react-native';
+import { ArrowUp, AudioLines, Plus } from 'lucide-react-native';
+import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { RecordingWaveform } from './RecordingWaveform';
-import type { SnippetState } from '../hooks/useAudioSnippet';
 
 /**
  * BottomAppCluster — bottom chat console.
@@ -25,12 +17,6 @@ import type { SnippetState } from '../hooks/useAudioSnippet';
  *  ──────────────────────
  *    • Default (no draft text):  black bg (#0a0a0a), AudioLines icon → voice mode
  *    • Draft non-empty:          orange bg (#FF5700),  ArrowUp icon  → onSend()
- *
- *  Mic button (middle-right) — Claude-style audio snippet recorder. Three
- *  visual states driven by `snippetState`:
- *    • idle       — ghost button + Mic icon
- *    • recording  — black filled bg + animated 4-bar waveform
- *    • processing — black filled bg + spinner (Whisper transcribing)
  *
  *  No background fade — the page already sits on PALETTE.canvas (#F6F6F3),
  *  so the cluster is transparent and the white pill floats directly on it.
@@ -50,9 +36,6 @@ type Props = {
   onVoicePress: () => void;
   onSend?: (text: string) => void;
   onPlusPress?: () => void;
-  /** Claude-style snippet recorder — pass null/undefined to hide. */
-  snippetState?: SnippetState;
-  onMicSnippetPress?: () => void;
 };
 
 export function BottomAppCluster({
@@ -63,8 +46,6 @@ export function BottomAppCluster({
   onVoicePress,
   onSend,
   onPlusPress,
-  snippetState = 'idle',
-  onMicSnippetPress,
 }: Props) {
   const insets = useSafeAreaInsets();
   const hasText = value.trim().length > 0;
@@ -106,32 +87,6 @@ export function BottomAppCluster({
             </Pressable>
 
             <View style={styles.controlsRight}>
-              <Pressable
-                onPress={onMicSnippetPress}
-                disabled={snippetState === 'processing'}
-                hitSlop={6}
-                accessibilityLabel={
-                  snippetState === 'recording'
-                    ? 'Stop recording'
-                    : snippetState === 'processing'
-                      ? 'Transcribing'
-                      : 'Record audio snippet'
-                }
-                style={({ pressed }) => [
-                  snippetState === 'idle' ? styles.ghostButton : styles.actionButton,
-                  snippetState !== 'idle' && { backgroundColor: VOICE_COLOR },
-                  pressed && styles.pressed,
-                ]}
-              >
-                {snippetState === 'recording' ? (
-                  <RecordingWaveform size={16} color="#ffffff" />
-                ) : snippetState === 'processing' ? (
-                  <ActivityIndicator size="small" color="#ffffff" />
-                ) : (
-                  <Mic size={20} color={VOICE_COLOR} strokeWidth={2} />
-                )}
-              </Pressable>
-
               <Pressable
                 onPress={handlePrimary}
                 disabled={!hasText && !voiceAvailable}

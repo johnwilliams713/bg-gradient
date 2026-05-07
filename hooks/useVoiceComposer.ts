@@ -34,19 +34,26 @@ const SILENT_END_ERRORS = new Set<string>(['no-speech', 'speech-timeout']);
 
 function normalizeVolume(raw: number): number {
   if (raw < 0) return 0;
-  return Math.min(1, raw / 7);
+  // Map device → [0,1] a bit more aggressively so waves hit higher bandEnv sooner.
+  return Math.min(1, raw / 4.75);
 }
 
 type Options = {
   onTranscript: (text: string) => void;
   onSessionEnd?: (lastTranscript: string) => void;
   onSessionStart?: () => void;
+  /**
+   * After this many ms without a new `result` event, call `stop()` to flush the
+   * utterance when the transcript is non-empty. Omit or ≤0 to disable.
+   */
+  silenceCommitMs?: number;
 };
 
 export function useVoiceComposer({
   onTranscript,
   onSessionEnd,
   onSessionStart,
+  silenceCommitMs,
 }: Options) {
   const [listening, setListening] = useState(false);
   const [muted, setMuted] = useState(false);
@@ -65,10 +72,34 @@ export function useVoiceComposer({
   listeningRef.current = listening;
   /** When true, the next recognition end must not commit (mic mute used `abort`). */
   const skipSessionEndRef = useRef(false);
+  const silenceCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const silenceCommitMsRef = useRef(silenceCommitMs);
+  silenceCommitMsRef.current = silenceCommitMs;
 
   useEffect(() => {
     const mod = speechMod?.ExpoSpeechRecognitionModule;
     if (!mod) return; // Expo Go – skip, no-op
+
+    const clearSilenceCommitTimer = () => {
+      if (silenceCommitTimerRef.current != null) {
+        clearTimeout(silenceCommitTimerRef.current);
+        silenceCommitTimerRef.current = null;
+      }
+    };
+
+    const scheduleSilenceCommit = () => {
+      clearSilenceCommitTimer();
+      const ms = silenceCommitMsRef.current;
+      if (ms == null || ms <= 0) return;
+      silenceCommitTimerRef.current = setTimeout(() => {
+        silenceCommitTimerRef.current = null;
+        const m = speechMod?.ExpoSpeechRecognitionModule;
+        if (!m || !listeningRef.current) return;
+        const t = transcriptRef.current.trim();
+        if (!t) return;
+        m.stop();
+      }, ms);
+    };
 
     const subs = [
       mod.addListener('volumechange', (ev: { value: number }) => {
@@ -78,6 +109,7 @@ export function useVoiceComposer({
         });
       }),
       mod.addListener('start', () => {
+        clearSilenceCommitTimer();
         setListening(true);
         setSpeechPickedUp(false);
         transcriptRef.current = '';
@@ -93,9 +125,11 @@ export function useVoiceComposer({
         onTranscriptRef.current(text);
         if (text.trim()) {
           setSpeechPickedUp(true);
+          scheduleSilenceCommit();
         }
       }),
       mod.addListener('end', () => {
+        clearSilenceCommitTimer();
         setListening(false);
         voiceEnergy.value = withTiming(0, { duration: 450 });
         const last = transcriptRef.current;
@@ -107,6 +141,7 @@ export function useVoiceComposer({
         onSessionEndRef.current?.(last);
       }),
       mod.addListener('error', (ev: { error: string; message: string }) => {
+        clearSilenceCommitTimer();
         setListening(false);
         voiceEnergy.value = withTiming(0, { duration: 250 });
         if (ev.error === 'aborted') {
@@ -120,6 +155,7 @@ export function useVoiceComposer({
     ];
 
     return () => {
+      clearSilenceCommitTimer();
       subs.forEach((s) => s.remove());
       try { mod.abort(); } catch { /* already stopped */ }
     };
@@ -160,6 +196,10 @@ export function useVoiceComposer({
    * expo-speech-recognition.
    */
   const muteRecognition = useCallback(() => {
+    if (silenceCommitTimerRef.current != null) {
+      clearTimeout(silenceCommitTimerRef.current);
+      silenceCommitTimerRef.current = null;
+    }
     const mod = speechMod?.ExpoSpeechRecognitionModule;
     if (!mod || !listeningRef.current) return;
     skipSessionEndRef.current = true;
@@ -189,6 +229,10 @@ export function useVoiceComposer({
    * If muted (no active session), commit synchronously using the ref or fallback.
    */
   const endVoiceSession = useCallback((fallbackTranscript = '') => {
+    if (silenceCommitTimerRef.current != null) {
+      clearTimeout(silenceCommitTimerRef.current);
+      silenceCommitTimerRef.current = null;
+    }
     const mod = speechMod?.ExpoSpeechRecognitionModule;
     setMuted(false);
     if (listeningRef.current && mod) {
