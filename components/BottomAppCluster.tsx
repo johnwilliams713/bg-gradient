@@ -1,13 +1,27 @@
 import { ArrowUp, AudioLines, Plus } from 'lucide-react-native';
-import { Pressable, StyleSheet, TextInput, View } from 'react-native';
+import * as Haptics from 'expo-haptics';
+import { useEffect, useState } from 'react';
+import {
+  Keyboard,
+  Platform,
+  Pressable,
+  StyleSheet,
+  TextInput,
+  View,
+  type KeyboardEvent,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+/** Space between composer and keyboard when keyboard is visible (iOS HIG–style tight gap). */
+const KEYBOARD_VERTICAL_GAP_PT = 8;
 
 /**
  * BottomAppCluster — bottom chat console.
  *
  *  Layout                Spacing source: Figma 11144:17878
  *  ────────────────────────────────────────────────────────
- *  Outer cluster         padding-x: 12, padding-bottom: insets.bottom + 14
+ *  Outer cluster         padding-x: 12; padding-bottom insets.bottom + 14 idle,
+ *                          KEYBOARD_VERTICAL_GAP_PT when keyboard visible (pairs with KAV).
  *  Primary console       white, radius 24, shadow (0,5,10) @ 10 % black
  *  Chat window           padding 6, gap 8 between text & controls
  *  Text area             padding-x 8, padding-y 10
@@ -49,17 +63,48 @@ export function BottomAppCluster({
 }: Props) {
   const insets = useSafeAreaInsets();
   const hasText = value.trim().length > 0;
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+
+  useEffect(() => {
+    const showEvent =
+      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent =
+      Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+
+    const onShow = (_e: KeyboardEvent) => setKeyboardOpen(true);
+    const onHide = (_e: KeyboardEvent) => setKeyboardOpen(false);
+
+    const showSub = Keyboard.addListener(showEvent, onShow);
+    const hideSub = Keyboard.addListener(hideEvent, onHide);
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
+  /** KeyboardAvoidingView already clears the keyboard; do not also apply full home inset. */
+  const paddingBottom = keyboardOpen
+    ? KEYBOARD_VERTICAL_GAP_PT
+    : insets.bottom + 14;
+  const paddingTop = keyboardOpen ? KEYBOARD_VERTICAL_GAP_PT : 24;
 
   const handlePrimary = () => {
     if (hasText) {
       onSend?.(value.trim());
     } else {
-      onVoicePress();
+      void (async () => {
+        try {
+          await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+        } catch {
+          /* unavailable (e.g. web) */
+        }
+        onVoicePress();
+      })();
     }
   };
 
   return (
-    <View style={[styles.cluster, { paddingBottom: insets.bottom + 14 }]}>
+    <View style={[styles.cluster, { paddingBottom, paddingTop }]}>
       <View style={styles.console}>
         <View style={styles.chatWindow}>
           <View style={styles.textArea}>
@@ -124,7 +169,6 @@ export function BottomAppCluster({
 const styles = StyleSheet.create({
   cluster: {
     paddingHorizontal: 12,
-    paddingTop: 24,
   },
   console: {
     backgroundColor: '#ffffff',

@@ -38,8 +38,8 @@ const REBA_PLACEHOLDER =
 /** After the placeholder is committed to the thread, wait before reopening the mic. */
 const VOICE_REACTIVATION_DELAY_MS = 450;
 
-/** Pixels above the thread bottom the last message should stay clear of (obstruction band). */
-const THREAD_BOTTOM_CLEARANCE_PX = 260;
+/** Extra scroll padding / clearance above the bottom overlay (composer + safe inset). */
+const BOTTOM_CONTENT_GAP_PX = 24;
 /** Collapsed header: padding (10+10) + 44px tap row. */
 const HEADER_EXPANDED_HEIGHT = 64;
 /** Voice mode: scrim height at top of thread (device top band). */
@@ -256,6 +256,11 @@ function AppContent() {
   const scrollViewportHRef = useRef(0);
   const contentHeightRef = useRef(0);
   const lastMessageBottomRef = useRef(0);
+  const bottomObstructionPxRef = useRef(260);
+
+  const [bottomScrollPad, setBottomScrollPad] = useState(
+    () => insets.bottom + 160 + BOTTOM_CONTENT_GAP_PX,
+  );
 
   const bumpThreadScrollIfNeeded = useCallback(() => {
     const scroll = threadScrollRef.current;
@@ -266,7 +271,8 @@ function AppContent() {
 
     const maxScroll = Math.max(0, contentH - H);
     const scrollY = scrollYRef.current;
-    const minY = lastBottom - H + THREAD_BOTTOM_CLEARANCE_PX;
+    const clearance = bottomObstructionPxRef.current + BOTTOM_CONTENT_GAP_PX;
+    const minY = lastBottom - H + clearance;
     if (minY <= scrollY + 0.5) return;
 
     const y = Math.min(Math.max(0, minY), maxScroll);
@@ -282,6 +288,16 @@ function AppContent() {
     const id = requestAnimationFrame(() => bumpThreadScrollIfNeeded());
     return () => cancelAnimationFrame(id);
   }, [messages, bumpThreadScrollIfNeeded]);
+
+  /** While voice UI is up, the composer is translated off-screen but still in layout — use a tighter inset. */
+  useEffect(() => {
+    if (voiceSessionActive) {
+      const h = insets.bottom + 132;
+      bottomObstructionPxRef.current = Math.max(h, 1);
+      setBottomScrollPad(h + BOTTOM_CONTENT_GAP_PX);
+    }
+    requestAnimationFrame(() => bumpThreadScrollIfNeeded());
+  }, [voiceSessionActive, insets.bottom, bumpThreadScrollIfNeeded]);
 
   return (
     <>
@@ -301,134 +317,142 @@ function AppContent() {
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           keyboardVerticalOffset={0}
         >
-          {/* Header — slides up / away in lockstep with the chat chrome transition */}
-          <Animated.View
-            style={[styles.headerShell, headerShellAnimatedStyle]}
-            pointerEvents={voiceSessionActive ? 'none' : 'auto'}
-          >
-            <Animated.View style={headerSlideStyle}>
-              <View style={styles.header}>
-                <RebaLogo width={HEADER_LOGO_W} height={HEADER_LOGO_H} />
-              </View>
-            </Animated.View>
-          </Animated.View>
-
-          {/* Thread */}
-          <View style={styles.threadWrap}>
-            <ScrollView
-              ref={threadScrollRef}
-              style={styles.thread}
-              contentContainerStyle={[
-                styles.threadContent,
-                {
-                  paddingTop: voiceSessionActive
-                    ? insets.top + 16
-                    : 16,
-                  paddingBottom: 20 + THREAD_BOTTOM_CLEARANCE_PX,
-                },
-              ]}
-              keyboardShouldPersistTaps="handled"
-              showsVerticalScrollIndicator={false}
-              scrollEventThrottle={16}
-              onScroll={(e) => {
-                scrollYRef.current = e.nativeEvent.contentOffset.y;
-              }}
-              onLayout={(e) => {
-                scrollViewportHRef.current = e.nativeEvent.layout.height;
-                bumpThreadScrollIfNeeded();
-              }}
-              onContentSizeChange={(_w, h) => {
-                contentHeightRef.current = h;
-                bumpThreadScrollIfNeeded();
-              }}
-            >
-              {messages.map((m, index) => (
-                <View
-                  key={m.id}
-                  style={[
-                    styles.messageRow,
-                    m.role === 'user' && styles.messageRowUser,
-                  ]}
-                  onLayout={
-                    index === messages.length - 1
-                      ? (e) => {
-                          const { y, height } = e.nativeEvent.layout;
-                          lastMessageBottomRef.current = y + height;
-                          bumpThreadScrollIfNeeded();
-                        }
-                      : undefined
-                  }
-                >
-                  {m.role === 'assistant' ? (
-                    <View style={styles.assistantBlock}>
-                      <Text style={styles.assistantLabel}>Reba</Text>
-                      <Text style={styles.messageText}>{m.text}</Text>
-                    </View>
-                  ) : (
-                    <View style={styles.userBubble}>
-                      <Text style={styles.userText}>{m.text}</Text>
-                    </View>
-                  )}
-                </View>
-              ))}
-            </ScrollView>
-            <Animated.View
-              pointerEvents="none"
-              style={[styles.voiceThreadTopFade, voiceThreadTopFadeStyle]}
-            >
-              <LinearGradient
-                style={styles.voiceThreadTopFadeGradient}
-                colors={[
-                  rgba(PALETTE.canvas, 0),
-                  rgba(PALETTE.canvas, 0),
-                  rgba(PALETTE.canvas, 1),
-                  rgba(PALETTE.canvas, 0),
+          <View style={styles.mainShell}>
+            <View style={styles.threadLayer}>
+              <ScrollView
+                ref={threadScrollRef}
+                style={styles.threadFill}
+                contentContainerStyle={[
+                  styles.threadContent,
+                  {
+                    paddingTop: voiceSessionActive
+                      ? insets.top + 16
+                      : HEADER_EXPANDED_HEIGHT + 16,
+                    paddingBottom: bottomScrollPad,
+                  },
                 ]}
-                locations={[...VOICE_THREAD_TOP_FADE_LOCATIONS]}
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
+                scrollEventThrottle={16}
+                onScroll={(e) => {
+                  scrollYRef.current = e.nativeEvent.contentOffset.y;
+                }}
+                onLayout={(e) => {
+                  scrollViewportHRef.current = e.nativeEvent.layout.height;
+                  bumpThreadScrollIfNeeded();
+                }}
+                onContentSizeChange={(_w, h) => {
+                  contentHeightRef.current = h;
+                  bumpThreadScrollIfNeeded();
+                }}
+              >
+                {messages.map((m, index) => (
+                  <View
+                    key={m.id}
+                    style={[
+                      styles.messageRow,
+                      m.role === 'user' && styles.messageRowUser,
+                    ]}
+                    onLayout={
+                      index === messages.length - 1
+                        ? (e) => {
+                            const { y, height } = e.nativeEvent.layout;
+                            lastMessageBottomRef.current = y + height;
+                            bumpThreadScrollIfNeeded();
+                          }
+                        : undefined
+                    }
+                  >
+                    {m.role === 'assistant' ? (
+                      <View style={styles.assistantBlock}>
+                        <Text style={styles.assistantLabel}>Reba</Text>
+                        <Text style={styles.messageText}>{m.text}</Text>
+                      </View>
+                    ) : (
+                      <View style={styles.userBubble}>
+                        <Text style={styles.userText}>{m.text}</Text>
+                      </View>
+                    )}
+                  </View>
+                ))}
+              </ScrollView>
+              <Animated.View
+                pointerEvents="none"
+                style={[styles.voiceThreadTopFade, voiceThreadTopFadeStyle]}
+              >
+                <LinearGradient
+                  style={styles.voiceThreadTopFadeGradient}
+                  colors={[
+                    rgba(PALETTE.canvas, 0),
+                    rgba(PALETTE.canvas, 0),
+                    rgba(PALETTE.canvas, 1),
+                    rgba(PALETTE.canvas, 0),
+                  ]}
+                  locations={[...VOICE_THREAD_TOP_FADE_LOCATIONS]}
+                />
+              </Animated.View>
+              <VoiceLiveTranscript
+                visible={voiceSessionActive}
+                liveText={draft}
+                speechPickedUp={speechPickedUp}
+                hasSpokenThisVoiceSession={hasSpokenInVoiceSession}
               />
-            </Animated.View>
-            <VoiceLiveTranscript
-              visible={voiceSessionActive}
-              liveText={draft}
-              speechPickedUp={speechPickedUp}
-              hasSpokenThisVoiceSession={hasSpokenInVoiceSession}
-            />
-          </View>
+            </View>
 
-          <View style={styles.bottomChrome}>
             <Animated.View
-              style={chatChromeStyle}
+              style={[styles.headerOverlay, headerShellAnimatedStyle]}
               pointerEvents={voiceSessionActive ? 'none' : 'auto'}
             >
-              <BottomAppCluster
-                value={draft}
-                onChangeText={setDraft}
-                listening={listening}
-                voiceAvailable={voiceAvailable}
-                onVoicePress={enterVoiceMode}
-                onSend={handleSendText}
-              />
+              <Animated.View style={headerSlideStyle}>
+                <View style={styles.header}>
+                  <RebaLogo width={HEADER_LOGO_W} height={HEADER_LOGO_H} />
+                </View>
+              </Animated.View>
             </Animated.View>
-            <Animated.View
-              pointerEvents={voiceSessionActive ? 'box-none' : 'none'}
-              style={[
-                styles.voiceChromeLayer,
-                voiceChromeStyle,
-              ]}
+
+            <View
+              style={styles.bottomChromeOverlay}
+              onLayout={(e) => {
+                const h = e.nativeEvent.layout.height;
+                bottomObstructionPxRef.current = Math.max(h, 1);
+                setBottomScrollPad(h + BOTTOM_CONTENT_GAP_PX);
+                requestAnimationFrame(() => bumpThreadScrollIfNeeded());
+              }}
             >
-              <View style={styles.voiceChromeStack} pointerEvents="box-none">
-                <View style={styles.voiceChromeFlexSpacer} pointerEvents="none" />
-                <VoiceSubtitleStrip
-                  visible={voiceSessionActive}
-                  text={draft}
+              <Animated.View
+                style={chatChromeStyle}
+                pointerEvents={voiceSessionActive ? 'none' : 'auto'}
+              >
+                <BottomAppCluster
+                  value={draft}
+                  onChangeText={setDraft}
+                  listening={listening}
+                  voiceAvailable={voiceAvailable}
+                  onVoicePress={enterVoiceMode}
+                  onSend={handleSendText}
                 />
-                <VoiceModeBottomBar
-                  muted={muted}
-                  onToggleMute={toggleMute}
-                  onStop={handleStopVoiceMode}
-                />
-              </View>
-            </Animated.View>
+              </Animated.View>
+              <Animated.View
+                pointerEvents={voiceSessionActive ? 'box-none' : 'none'}
+                style={[
+                  styles.voiceChromeLayer,
+                  voiceChromeStyle,
+                ]}
+              >
+                <View style={styles.voiceChromeStack} pointerEvents="box-none">
+                  <View style={styles.voiceChromeFlexSpacer} pointerEvents="none" />
+                  <VoiceSubtitleStrip
+                    visible={voiceSessionActive}
+                    text={draft}
+                  />
+                  <VoiceModeBottomBar
+                    muted={muted}
+                    onToggleMute={toggleMute}
+                    onStop={handleStopVoiceMode}
+                  />
+                </View>
+              </Animated.View>
+            </View>
           </View>
         </KeyboardAvoidingView>
       </SafeAreaView>
@@ -448,8 +472,31 @@ const styles = StyleSheet.create({
   flex: {
     flex: 1,
   },
-  headerShell: {
+  headerOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 10,
     overflow: 'hidden',
+  },
+  mainShell: {
+    flex: 1,
+    position: 'relative',
+  },
+  threadLayer: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 0,
+  },
+  threadFill: {
+    flex: 1,
+  },
+  bottomChromeOverlay: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    zIndex: 10,
   },
   header: {
     flexDirection: 'row',
@@ -459,9 +506,8 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     minHeight: 44,
   },
-  threadWrap: {
-    flex: 1,
-    position: 'relative',
+  threadContent: {
+    paddingHorizontal: 20,
   },
   voiceThreadTopFade: {
     position: 'absolute',
@@ -472,9 +518,6 @@ const styles = StyleSheet.create({
   },
   voiceThreadTopFadeGradient: {
     ...StyleSheet.absoluteFillObject,
-  },
-  bottomChrome: {
-    position: 'relative',
   },
   voiceChromeLayer: {
     position: 'absolute',
@@ -489,12 +532,6 @@ const styles = StyleSheet.create({
   },
   voiceChromeFlexSpacer: {
     flex: 1,
-  },
-  thread: {
-    flex: 1,
-  },
-  threadContent: {
-    paddingHorizontal: 20,
   },
   messageRow: {
     marginBottom: 20,

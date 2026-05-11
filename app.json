@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Reba",
+    "name": "Reba Demo",
     "slug": "bg-gradient",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -14,7 +14,9 @@
     },
     "ios": {
       "supportsTablet": true,
+      "appleTeamId": "PMT4WEC6MP",
       "infoPlist": {
+        "CFBundleDisplayName": "Reba Demo",
         "NSSpeechRecognitionUsageDescription": "Allow $(PRODUCT_NAME) to use speech recognition.",
         "NSMicrophoneUsageDescription": "Allow $(PRODUCT_NAME) to use the microphone."
       },
@@ -29,7 +31,8 @@
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "android.permission.RECORD_AUDIO"
-      ]
+      ],
+      "label": "Reba Demo"
     },
     "web": {
       "favicon": "./assets/favicon.png"

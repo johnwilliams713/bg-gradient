@@ -1,4 +1,6 @@
-import { AudioLines, Mic, MicOff, Settings } from 'lucide-react-native';
+import { Mic, MicOff, Settings } from 'lucide-react-native';
+import { AnimatedAudioLinesIcon } from './AnimatedAudioLinesIcon';
+import * as Haptics from 'expo-haptics';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { StyleProp, ViewStyle } from 'react-native';
@@ -62,7 +64,16 @@ export function VoiceModeBottomBar({
 
         <View style={styles.rightCluster}>
           <Pressable
-            onPress={onToggleMute}
+            onPress={() => {
+              void (async () => {
+                try {
+                  await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                } catch {
+                  /* unavailable (e.g. web) */
+                }
+                onToggleMute();
+              })();
+            }}
             hitSlop={6}
             accessibilityLabel={muted ? 'Unmute microphone' : 'Mute microphone'}
             accessibilityRole="button"
@@ -80,13 +91,16 @@ export function VoiceModeBottomBar({
           </Pressable>
 
           <Pressable
-            onPress={onStop}
+            onPress={() => {
+              void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+              onStop();
+            }}
             hitSlop={6}
             accessibilityLabel="Stop voice mode"
             accessibilityRole="button"
             style={({ pressed }) => [styles.stopPill, pressed && styles.pressed]}
           >
-            <AudioLines size={22} color="#ffffff" strokeWidth={2} />
+            <AnimatedAudioLinesIcon size={22} color="#ffffff" strokeWidth={2} />
             <Text style={styles.stopLabel}>Stop</Text>
           </Pressable>
         </View>

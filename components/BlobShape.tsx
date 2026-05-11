@@ -13,17 +13,16 @@
  *            whose unequal temporal speeds make peaks and troughs drift in
  *            place — a slow ocean-swell feel with no horizontal scroll. Full
  *            screen width.
- *   • Voice: each layer adds a centred, strictly non-negative "swell" on top
- *            of the ambient surface:
+ *   • Voice: each layer adds a strictly non-negative "swell" on top of the
+ *            ambient surface:
  *
- *              voiceShape(u) = bell(u) · (1 + RIPPLE_AMP · cos(2πk·(u − ½)))
+ *              voiceShape(u) = bell(u, peakU) · (1 + RIPPLE_AMP · cos(2πk·(u − peakU)))
  *
- *            bell(u) = sin(π·u)^BELL_POWER is zero at the edges, peaks at
- *            u = ½. The cosine ripple is centred on u = ½ so the result is
- *            automatically left-right symmetric, and (1 + amp·cos) stays
- *            positive while RIPPLE_AMP < 1, so the swell only ever pushes
- *            the wave UPWARD — no center-sinking. Each layer's swell is
- *            scaled by its assigned voice band envelope:
+ *            bell = Hanning edge (sin(π·u)^{BELL_POWER}) times a Gaussian bump
+ *            centred at layer-specific `peakU` (BACK / MID / FORE staggered) so
+ *            crests don’t align on one vertical line. (1 + amp·cos) stays
+ *            positive while RIPPLE_AMP < 1. Each layer's swell is scaled by its
+ *            voice band envelope:
  *
  *               BACK  ←  low envelope   (slow attack/release)
  *               MID   ←  mid envelope   (rhythm-tracking)
@@ -129,6 +128,23 @@ const TWO_PI = Math.PI * 2;
 //   3.0+ — narrow central swell, very flat edges
 const BELL_POWER = 2.0;
 
+/**
+ * Voice bump: zero at u=0 and u=1 (via Hanning edge), peak near `peakU`.
+ * Staggers the three layers so voice crests don’t pile on the same vertical line.
+ */
+function layerVoiceBell(u: number, peakU: number): number {
+  'worklet';
+  const sigma = 0.27;
+  const edge = Math.pow(Math.sin(Math.PI * u), BELL_POWER);
+  const bump = Math.exp(-Math.pow((u - peakU) / sigma, 2));
+  return edge * bump;
+}
+
+/** Normalized x (0…1) where each layer’s voice swell peaks — fore center, mid left, back right. */
+const BACK_VOICE_PEAK_U = 0.67;
+const MID_VOICE_PEAK_U = 0.33;
+const FORE_VOICE_PEAK_U = 0.5;
+
 // Number of cosine cycles across the full width. Visible peaks land at
 // u = 0.5, 0.5 ± 1/k, 0.5 ± 2/k, …; only the central few are amplified by
 // bell(u) — the rest fade to zero before they reach the screen edges.
@@ -150,19 +166,19 @@ type LayerHarmonics = {
 };
 
 const BACK_HARMONICS: LayerHarmonics = {
-  h1a: { k: 1.0, omega: 0.200, phase: 0           },
-  h1b: { k: 1.3, omega: 0.330, phase: Math.PI / 5 },
+  h1a: { k: 1.0, omega: 0.200, phase: Math.PI * 0.11 },
+  h1b: { k: 1.3, omega: 0.330, phase: Math.PI * 0.34 },
 };
 
 const MID_HARMONICS: LayerHarmonics = {
   // k / phase chosen so hills don’t line up with BACK’s 1.0 / 1.3 pair — distinct peaks.
-  h1a: { k: 0.86, omega: 0.22, phase: Math.PI * 0.52 },
-  h1b: { k: 1.52, omega: 0.19, phase: Math.PI * 0.38 },
+  h1a: { k: 0.86, omega: 0.22, phase: Math.PI * 0.67 },
+  h1b: { k: 1.52, omega: 0.19, phase: Math.PI * 0.09 },
 };
 
 const FORE_HARMONICS: LayerHarmonics = {
-  h1a: { k: 1.08, omega: 0.28, phase: Math.PI * 0.21 },
-  h1b: { k: 1.58, omega: 0.36, phase: Math.PI * 0.67 },
+  h1a: { k: 1.08, omega: 0.28, phase: Math.PI * 0.93 },
+  h1b: { k: 1.58, omega: 0.36, phase: Math.PI * 0.41 },
 };
 
 // Ambient roll speed per layer (shared clock × scale). Back = slow / “far”,
@@ -319,6 +335,7 @@ export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
       BACK_H1_AMP,
       BACK_VOICE_GAIN,
       PARALLAX_TIME_BACK,
+      BACK_VOICE_PEAK_U,
     );
   });
 
@@ -332,6 +349,7 @@ export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
       MID_H1_AMP,
       MID_VOICE_GAIN,
       PARALLAX_TIME_MID,
+      MID_VOICE_PEAK_U,
     );
   });
 
@@ -345,6 +363,7 @@ export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
       FORE_H1_AMP,
       FORE_VOICE_GAIN,
       PARALLAX_TIME_FORE,
+      FORE_VOICE_PEAK_U,
     );
   });
 
@@ -423,6 +442,7 @@ export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
  *
  * Swell uses the unscaled clock so voice reactivity stays aligned across layers;
  * only H₁ ambient sine phases use `ambientTimeScale` for parallax.
+ * `voicePeakU` shifts each layer’s voiced bump so crests don’t line up on one x.
  */
 function buildWavePath(
   t: number,
@@ -432,6 +452,7 @@ function buildWavePath(
   h1Amp: number,
   voiceGain: number,
   ambientTimeScale: number,
+  voicePeakU: number,
 ) {
   'worklet';
   const ta = t * ambientTimeScale;
@@ -446,11 +467,9 @@ function buildWavePath(
   for (let i = 0; i < SAMPLE_COUNT; i++) {
     const u = i / (SAMPLE_COUNT - 1);
 
-    // Centred non-negative voice swell. bell goes 0→1→0 across the width;
-    // the cosine ripple is centred on u = 0.5 so the whole shape is symmetric.
-    // (1 + amp·cos) stays > 0 for amp < 1, so voiceLift is ≥ 0 everywhere.
-    const bell      = Math.pow(Math.sin(Math.PI * u), BELL_POWER);
-    const ripple    = Math.cos(TWO_PI * VOICE_RIPPLE_K * (u - 0.5));
+    // Centred non-negative voice swell; peak follows `voicePeakU` per layer.
+    const bell      = layerVoiceBell(u, voicePeakU);
+    const ripple    = Math.cos(TWO_PI * VOICE_RIPPLE_K * (u - voicePeakU));
     const voiceLift = bandEnv * voiceGain * bell * (1 + VOICE_RIPPLE_AMP * ripple);
 
     const y = baseline
