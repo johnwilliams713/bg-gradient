@@ -1,27 +1,21 @@
-import { ArrowUp, AudioLines, Plus } from 'lucide-react-native';
-import * as Haptics from 'expo-haptics';
-import { useEffect, useState } from 'react';
+import { ArrowUp, AudioLines, Mic, Plus } from 'lucide-react-native';
 import {
-  Keyboard,
-  Platform,
+  ActivityIndicator,
   Pressable,
   StyleSheet,
   TextInput,
   View,
-  type KeyboardEvent,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-
-/** Space between composer and keyboard when keyboard is visible (iOS HIG–style tight gap). */
-const KEYBOARD_VERTICAL_GAP_PT = 8;
+import { RecordingWaveform } from './RecordingWaveform';
+import type { SnippetState } from '../hooks/useAudioSnippet';
 
 /**
  * BottomAppCluster — bottom chat console.
  *
  *  Layout                Spacing source: Figma 11144:17878
  *  ────────────────────────────────────────────────────────
- *  Outer cluster         padding-x: 12; padding-bottom insets.bottom + 14 idle,
- *                          KEYBOARD_VERTICAL_GAP_PT when keyboard visible (pairs with KAV).
+ *  Outer cluster         padding-x: 12, padding-bottom: insets.bottom + 14
  *  Primary console       white, radius 24, shadow (0,5,10) @ 10 % black
  *  Chat window           padding 6, gap 8 between text & controls
  *  Text area             padding-x 8, padding-y 10
@@ -31,6 +25,12 @@ const KEYBOARD_VERTICAL_GAP_PT = 8;
  *  ──────────────────────
  *    • Default (no draft text):  black bg (#0a0a0a), AudioLines icon → voice mode
  *    • Draft non-empty:          orange bg (#FF5700),  ArrowUp icon  → onSend()
+ *
+ *  Mic button (middle-right) — Claude-style audio snippet recorder. Three
+ *  visual states driven by `snippetState`:
+ *    • idle       — ghost button + Mic icon
+ *    • recording  — black filled bg + animated 4-bar waveform
+ *    • processing — black filled bg + spinner (Whisper transcribing)
  *
  *  No background fade — the page already sits on PALETTE.canvas (#F6F6F3),
  *  so the cluster is transparent and the white pill floats directly on it.
@@ -50,6 +50,9 @@ type Props = {
   onVoicePress: () => void;
   onSend?: (text: string) => void;
   onPlusPress?: () => void;
+  /** Claude-style snippet recorder — pass null/undefined to hide. */
+  snippetState?: SnippetState;
+  onMicSnippetPress?: () => void;
 };
 
 export function BottomAppCluster({
@@ -60,51 +63,22 @@ export function BottomAppCluster({
   onVoicePress,
   onSend,
   onPlusPress,
+  snippetState = 'idle',
+  onMicSnippetPress,
 }: Props) {
   const insets = useSafeAreaInsets();
   const hasText = value.trim().length > 0;
-  const [keyboardOpen, setKeyboardOpen] = useState(false);
-
-  useEffect(() => {
-    const showEvent =
-      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
-    const hideEvent =
-      Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
-
-    const onShow = (_e: KeyboardEvent) => setKeyboardOpen(true);
-    const onHide = (_e: KeyboardEvent) => setKeyboardOpen(false);
-
-    const showSub = Keyboard.addListener(showEvent, onShow);
-    const hideSub = Keyboard.addListener(hideEvent, onHide);
-    return () => {
-      showSub.remove();
-      hideSub.remove();
-    };
-  }, []);
-
-  /** KeyboardAvoidingView already clears the keyboard; do not also apply full home inset. */
-  const paddingBottom = keyboardOpen
-    ? KEYBOARD_VERTICAL_GAP_PT
-    : insets.bottom + 14;
-  const paddingTop = keyboardOpen ? KEYBOARD_VERTICAL_GAP_PT : 24;
 
   const handlePrimary = () => {
     if (hasText) {
       onSend?.(value.trim());
     } else {
-      void (async () => {
-        try {
-          await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-        } catch {
-          /* unavailable (e.g. web) */
-        }
-        onVoicePress();
-      })();
+      onVoicePress();
     }
   };
 
   return (
-    <View style={[styles.cluster, { paddingBottom, paddingTop }]}>
+    <View style={[styles.cluster, { paddingBottom: insets.bottom + 14 }]}>
       <View style={styles.console}>
         <View style={styles.chatWindow}>
           <View style={styles.textArea}>
@@ -132,6 +106,32 @@ export function BottomAppCluster({
             </Pressable>
 
             <View style={styles.controlsRight}>
+              <Pressable
+                onPress={onMicSnippetPress}
+                disabled={snippetState === 'processing'}
+                hitSlop={6}
+                accessibilityLabel={
+                  snippetState === 'recording'
+                    ? 'Stop recording'
+                    : snippetState === 'processing'
+                      ? 'Transcribing'
+                      : 'Record audio snippet'
+                }
+                style={({ pressed }) => [
+                  snippetState === 'idle' ? styles.ghostButton : styles.actionButton,
+                  snippetState !== 'idle' && { backgroundColor: VOICE_COLOR },
+                  pressed && styles.pressed,
+                ]}
+              >
+                {snippetState === 'recording' ? (
+                  <RecordingWaveform size={16} color="#ffffff" />
+                ) : snippetState === 'processing' ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Mic size={20} color={VOICE_COLOR} strokeWidth={2} />
+                )}
+              </Pressable>
+
               <Pressable
                 onPress={handlePrimary}
                 disabled={!hasText && !voiceAvailable}
@@ -169,6 +169,7 @@ export function BottomAppCluster({
 const styles = StyleSheet.create({
   cluster: {
     paddingHorizontal: 12,
+    paddingTop: 24,
   },
   console: {
     backgroundColor: '#ffffff',

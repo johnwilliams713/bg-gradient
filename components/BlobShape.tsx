@@ -13,16 +13,17 @@
  *            whose unequal temporal speeds make peaks and troughs drift in
  *            place — a slow ocean-swell feel with no horizontal scroll. Full
  *            screen width.
- *   • Voice: each layer adds a strictly non-negative "swell" on top of the
- *            ambient surface:
+ *   • Voice: each layer adds a centred, strictly non-negative "swell" on top
+ *            of the ambient surface:
  *
- *              voiceShape(u) = bell(u, peakU) · (1 + RIPPLE_AMP · cos(2πk·(u − peakU)))
+ *              voiceShape(u) = bell(u) · (1 + RIPPLE_AMP · cos(2πk·(u − ½)))
  *
- *            bell = Hanning edge (sin(π·u)^{BELL_POWER}) times a Gaussian bump
- *            centred at layer-specific `peakU` (BACK / MID / FORE staggered) so
- *            crests don’t align on one vertical line. (1 + amp·cos) stays
- *            positive while RIPPLE_AMP < 1. Each layer's swell is scaled by its
- *            voice band envelope:
+ *            bell(u) = sin(π·u)^BELL_POWER is zero at the edges, peaks at
+ *            u = ½. The cosine ripple is centred on u = ½ so the result is
+ *            automatically left-right symmetric, and (1 + amp·cos) stays
+ *            positive while RIPPLE_AMP < 1, so the swell only ever pushes
+ *            the wave UPWARD — no center-sinking. Each layer's swell is
+ *            scaled by its assigned voice band envelope:
  *
  *               BACK  ←  low envelope   (slow attack/release)
  *               MID   ←  mid envelope   (rhythm-tracking)
@@ -71,21 +72,18 @@ const { width: SCREEN_W } = Dimensions.get('window');
 
 const WAVE_HEIGHT = 400; // canvas height; gives ~100 px headroom above tallest baseline for voice ripples
 
-// Ambient (chat): tuck behind composer. Base = 25 % canvas height + 30 px.
-const AMBIENT_VERTICAL_NUDGE = WAVE_HEIGHT * 0.25 + 30;
-
-// Voice UI translateY: halfway between original voice target (0) and the
-// stronger tuck (AMBIENT + 56) — less viewport, not as low as the full tuck.
-const VOICE_ACTIVE_VERTICAL_NUDGE = (AMBIENT_VERTICAL_NUDGE + 56) / 2;
+// In ambient mode the whole canvas sits this many px lower so waves read as
+// hiding behind the bottom chat cluster; voice mode eases back to 0 (current
+// placement). 25 % of canvas height matches the design brief.
+const AMBIENT_VERTICAL_NUDGE = WAVE_HEIGHT * 0.25;
 
 const BACK_HEIGHT = 260;
-// Extra vertical gap vs back so mid crests don’t sit on the rear layer (was 240 → too tight).
-const MID_HEIGHT  = 218;
-const FORE_HEIGHT = 196;
+const MID_HEIGHT  = 240;
+const FORE_HEIGHT = 200;
 
 const BACK_BASELINE_Y = WAVE_HEIGHT - BACK_HEIGHT; // 140
-const MID_BASELINE_Y  = WAVE_HEIGHT - MID_HEIGHT;  // 182
-const FORE_BASELINE_Y = WAVE_HEIGHT - FORE_HEIGHT; // 204
+const MID_BASELINE_Y  = WAVE_HEIGHT - MID_HEIGHT;  // 160
+const FORE_BASELINE_Y = WAVE_HEIGHT - FORE_HEIGHT; // 200
 
 // Path resolution. With cubic-Bezier smoothing, even modest sample counts read
 // as fully smooth; 48 leaves plenty of headroom for the voice H3 ripples
@@ -93,10 +91,10 @@ const FORE_BASELINE_Y = WAVE_HEIGHT - FORE_HEIGHT; // 204
 const SAMPLE_COUNT = 48;
 
 // ─── Audio envelope follower coefficients ───────────────────────────────────
-const LOW_LERP   = 0.11;
-const MID_LERP   = 0.32;
-const HIGH_DECAY = 0.72;
-const HIGH_GAIN  = 6.5;
+const LOW_LERP   = 0.07;
+const MID_LERP   = 0.22;
+const HIGH_DECAY = 0.78;
+const HIGH_GAIN  = 4.0;
 
 // ─── Wave model ──────────────────────────────────────────────────────────────
 //
@@ -128,23 +126,6 @@ const TWO_PI = Math.PI * 2;
 //   3.0+ — narrow central swell, very flat edges
 const BELL_POWER = 2.0;
 
-/**
- * Voice bump: zero at u=0 and u=1 (via Hanning edge), peak near `peakU`.
- * Staggers the three layers so voice crests don’t pile on the same vertical line.
- */
-function layerVoiceBell(u: number, peakU: number): number {
-  'worklet';
-  const sigma = 0.27;
-  const edge = Math.pow(Math.sin(Math.PI * u), BELL_POWER);
-  const bump = Math.exp(-Math.pow((u - peakU) / sigma, 2));
-  return edge * bump;
-}
-
-/** Normalized x (0…1) where each layer’s voice swell peaks — fore center, mid left, back right. */
-const BACK_VOICE_PEAK_U = 0.67;
-const MID_VOICE_PEAK_U = 0.33;
-const FORE_VOICE_PEAK_U = 0.5;
-
 // Number of cosine cycles across the full width. Visible peaks land at
 // u = 0.5, 0.5 ± 1/k, 0.5 ± 2/k, …; only the central few are amplified by
 // bell(u) — the rest fade to zero before they reach the screen edges.
@@ -156,7 +137,7 @@ const VOICE_RIPPLE_K = 2;
 
 // Ripple depth (0..1). Larger = more pronounced side peaks vs. central peak.
 // Must be < 1 to keep voiceShape non-negative.
-const VOICE_RIPPLE_AMP = 0.32;
+const VOICE_RIPPLE_AMP = 0.20;
 
 type Harmonic = { k: number; omega: number; phase: number };
 
@@ -166,32 +147,31 @@ type LayerHarmonics = {
 };
 
 const BACK_HARMONICS: LayerHarmonics = {
-  h1a: { k: 1.0, omega: 0.200, phase: Math.PI * 0.11 },
-  h1b: { k: 1.3, omega: 0.330, phase: Math.PI * 0.34 },
+  h1a: { k: 1.0, omega: 0.200, phase: 0           },
+  h1b: { k: 1.3, omega: 0.330, phase: Math.PI / 5 },
 };
 
 const MID_HARMONICS: LayerHarmonics = {
-  // k / phase chosen so hills don’t line up with BACK’s 1.0 / 1.3 pair — distinct peaks.
-  h1a: { k: 0.86, omega: 0.22, phase: Math.PI * 0.67 },
-  h1b: { k: 1.52, omega: 0.19, phase: Math.PI * 0.09 },
+  h1a: { k: 1.1, omega: 0.250, phase: Math.PI / 7 },
+  h1b: { k: 1.4, omega: 0.175, phase: Math.PI / 3 },
 };
 
 const FORE_HARMONICS: LayerHarmonics = {
-  h1a: { k: 1.08, omega: 0.28, phase: Math.PI * 0.93 },
-  h1b: { k: 1.58, omega: 0.36, phase: Math.PI * 0.41 },
+  h1a: { k: 1.2, omega: 0.300, phase: Math.PI / 11 },
+  h1b: { k: 1.5, omega: 0.400, phase: Math.PI / 2  },
 };
 
 // Ambient roll speed per layer (shared clock × scale). Back = slow / “far”,
 // fore = faster / “near” — peaks and troughs shear past each other slightly.
-const PARALLAX_TIME_BACK = 0.74;
-const PARALLAX_TIME_MID  = 1.06;
+const PARALLAX_TIME_BACK = 0.78;
+const PARALLAX_TIME_MID  = 1.0;
 const PARALLAX_TIME_FORE = 1.22;
 
 // H1 (rolling-hill) amplitudes per layer in px. H1a / H1b are split 55 / 45:
 // nearly even — H1a is the slow carrier, H1b the visible morphing component,
 // so giving H1b real weight is what makes peaks "shift" instead of just sit.
-const BACK_H1_AMP = 44;
-const MID_H1_AMP  = 31;
+const BACK_H1_AMP = 46;
+const MID_H1_AMP  = 35;
 const FORE_H1_AMP = 27;
 
 const H1_SPLIT_A = 0.55;
@@ -199,10 +179,11 @@ const H1_SPLIT_B = 0.45;
 
 // Per-layer voice swell amplitude (px). At bandEnv = 1 and the voice shape's
 // peak (u = 0.5), the wave is pushed up by VOICE_GAIN · (1 + VOICE_RIPPLE_AMP)
-// pixels. Tuned for obvious speak peaks vs ambient (was ~57 / 46 / 35).
-const BACK_VOICE_GAIN = 92;
-const MID_VOICE_GAIN  = 74;
-const FORE_VOICE_GAIN = 58;
+// pixels. With BACK_VOICE_GAIN = 50 and RIPPLE_AMP = 0.35, that's ~67 px max
+// — comfortably within the canvas headroom above each baseline.
+const BACK_VOICE_GAIN = 57.5;
+const MID_VOICE_GAIN  = 46;
+const FORE_VOICE_GAIN = 34.5;
 
 // ─── Bloom + edge softening ──────────────────────────────────────────────────
 //
@@ -249,9 +230,9 @@ const GRAD_COLORS_INVERTED = ['rgba(253,230,138,0.40)', 'rgba(255,87,0,0.15)'];
 const LAYER_OPACITY_IDLE   = 0.5;
 const LAYER_OPACITY_ACTIVE = 1.0;
 
-const BACK_GRAD_TOP = BACK_BASELINE_Y - BACK_H1_AMP;
-const MID_GRAD_TOP  = MID_BASELINE_Y  - MID_H1_AMP;
-const FORE_GRAD_TOP = FORE_BASELINE_Y - FORE_H1_AMP;
+const BACK_GRAD_TOP = BACK_BASELINE_Y - BACK_H1_AMP; // = 94
+const MID_GRAD_TOP  = MID_BASELINE_Y  - MID_H1_AMP;  // = 125
+const FORE_GRAD_TOP = FORE_BASELINE_Y - FORE_H1_AMP; // = 173
 
 type Props = {
   voiceEnergy: SharedValue<number>;
@@ -304,7 +285,7 @@ export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
         translateY: interpolate(
           voiceChromeProgress.value,
           [0, 1],
-          [AMBIENT_VERTICAL_NUDGE, VOICE_ACTIVE_VERTICAL_NUDGE],
+          [AMBIENT_VERTICAL_NUDGE, 0],
         ),
       },
     ],
@@ -335,7 +316,6 @@ export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
       BACK_H1_AMP,
       BACK_VOICE_GAIN,
       PARALLAX_TIME_BACK,
-      BACK_VOICE_PEAK_U,
     );
   });
 
@@ -349,7 +329,6 @@ export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
       MID_H1_AMP,
       MID_VOICE_GAIN,
       PARALLAX_TIME_MID,
-      MID_VOICE_PEAK_U,
     );
   });
 
@@ -363,7 +342,6 @@ export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
       FORE_H1_AMP,
       FORE_VOICE_GAIN,
       PARALLAX_TIME_FORE,
-      FORE_VOICE_PEAK_U,
     );
   });
 
@@ -442,7 +420,6 @@ export function BlobShape({ voiceEnergy, voiceChromeProgress }: Props) {
  *
  * Swell uses the unscaled clock so voice reactivity stays aligned across layers;
  * only H₁ ambient sine phases use `ambientTimeScale` for parallax.
- * `voicePeakU` shifts each layer’s voiced bump so crests don’t line up on one x.
  */
 function buildWavePath(
   t: number,
@@ -452,7 +429,6 @@ function buildWavePath(
   h1Amp: number,
   voiceGain: number,
   ambientTimeScale: number,
-  voicePeakU: number,
 ) {
   'worklet';
   const ta = t * ambientTimeScale;
@@ -467,9 +443,11 @@ function buildWavePath(
   for (let i = 0; i < SAMPLE_COUNT; i++) {
     const u = i / (SAMPLE_COUNT - 1);
 
-    // Centred non-negative voice swell; peak follows `voicePeakU` per layer.
-    const bell      = layerVoiceBell(u, voicePeakU);
-    const ripple    = Math.cos(TWO_PI * VOICE_RIPPLE_K * (u - voicePeakU));
+    // Centred non-negative voice swell. bell goes 0→1→0 across the width;
+    // the cosine ripple is centred on u = 0.5 so the whole shape is symmetric.
+    // (1 + amp·cos) stays > 0 for amp < 1, so voiceLift is ≥ 0 everywhere.
+    const bell      = Math.pow(Math.sin(Math.PI * u), BELL_POWER);
+    const ripple    = Math.cos(TWO_PI * VOICE_RIPPLE_K * (u - 0.5));
     const voiceLift = bandEnv * voiceGain * bell * (1 + VOICE_RIPPLE_AMP * ripple);
 
     const y = baseline
